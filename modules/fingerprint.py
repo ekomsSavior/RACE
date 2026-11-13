@@ -1,11 +1,16 @@
 from typing import Any
 
-from transports.ble import BLETransport
+from transports.ble import BLETransport, ClientFactory
 from utils.config import RACEConfig
 from utils.packet import CMD_GET_BUILD
 
 
-async def fingerprint(target: str, config: RACEConfig | None = None) -> dict[str, Any]:
+async def fingerprint(
+    target: str,
+    config: RACEConfig | None = None,
+    *,
+    client_factory: ClientFactory | None = None,
+) -> dict[str, Any]:
     """Fingerprint a RACE device's build info.
 
     Returns ``{"status": "success", "build": str}`` on success or
@@ -15,7 +20,9 @@ async def fingerprint(target: str, config: RACEConfig | None = None) -> dict[str
     result: dict[str, Any] = {"status": "error", "message": "not run"}
 
     try:
-        async with BLETransport(target, config=cfg) as transport:
+        async with BLETransport(
+            target, config=cfg, client_factory=client_factory
+        ) as transport:
             raw = await transport.send_command(CMD_GET_BUILD)
             build_string = raw.decode("utf-8", errors="ignore").strip("\x00")
             result = {"status": "success", "build": build_string}

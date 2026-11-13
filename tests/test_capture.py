@@ -5,6 +5,7 @@ import struct
 
 import pytest
 
+from transports.ble import BLETransport
 from utils.capture import (
     ACL_HANDLE,
     ATT_OP_NOTIFICATION,
@@ -30,8 +31,11 @@ from utils.capture import (
     CaptureFormat,
     WireCapture,
     build_att_record,
+    close_captures,
     open_capture,
+    tap,
 )
+from utils.config import RACEConfig
 from utils.packet import CMD_GET_BUILD, build_race_packet
 
 FRAME_TX = build_race_packet(CMD_GET_BUILD)
@@ -41,6 +45,14 @@ PCAP_HEADER = struct.Struct("<IHHiIII")
 PCAP_RECORD = struct.Struct("<IIII")
 BTSNOOP_HEADER = struct.Struct(">II")
 BTSNOOP_RECORD = struct.Struct(">IIIIQ")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_captures():
+    """Drop shared capture handles between tests (temp dirs disappear)."""
+    close_captures()
+    yield
+    close_captures()
 
 
 def _clock(value):
@@ -321,6 +333,45 @@ def test_explicit_arguments_beat_environment(tmp_path, monkeypatch):
         capture.close()
 
 
+def test_open_capture_shares_one_sink_per_path(tmp_path, monkeypatch):
+    monkeypatch.delenv(CAPTURE_ENV_VAR, raising=False)
+    path = tmp_path / "shared.pcap"
+
+    first = open_capture(path)
+    second = open_capture(path)
+    assert first is second
+    assert tap(first, "tx", FRAME_TX)
+    assert tap(second, "rx", FRAME_RX)
+
+    (capture,) = close_captures()
+    assert capture is first
+    assert capture.closed
+    assert [att["value"] for att in map(_att_fields, (r[3] for r in _pcap_records(path)))] == [
+        FRAME_TX,
+        FRAME_RX,
+    ]
+
+    # A closed sink is dropped from the registry, so a later session starts clean.
+    reopened = open_capture(path)
+    assert reopened is not None
+    assert reopened is not first
+    assert not reopened.closed
+
+
+def test_tap_is_best_effort(tmp_path):
+    assert tap(None, "tx", FRAME_TX) is False  # capture disabled
+    assert tap(WireCapture(tmp_path / "x.pcap"), "tx", FRAME_TX) is False  # not open
+
+    capture = WireCapture(tmp_path / "y.pcap").open()
+    try:
+        assert tap(capture, "tx", object()) is False  # type: ignore[arg-type]
+        assert tap(capture, "tx", FRAME_TX) is True
+        capture.close()
+        assert tap(capture, "tx", FRAME_TX) is False  # closed file is swallowed
+    finally:
+        capture.close()
+
+
 def test_open_creates_parent_directories(tmp_path):
     path = tmp_path / "sessions" / "2026" / "race.pcap"
     with WireCapture(path):
@@ -359,7 +410,6 @@ class _FakeClient:
         self.address = address
         self.services = [_FakeService()]
         self.is_connected = False
-        self.pending = b""
         self.notify_handler = None
 
     async def connect(self, timeout=None):
@@ -368,30 +418,24 @@ class _FakeClient:
     async def disconnect(self):
         self.is_connected = False
 
-    def start_notify(self, char, handler):
+    async def start_notify(self, char, handler):
         self.notify_handler = handler
 
     async def write_gatt_char(self, char, data, response=True):
-        self.pending = FRAME_RX
         self.notify_handler(None, FRAME_RX)
 
-    def read_gatt_char(self, char):
-        return self.pending
 
+def _run_transport(capture_path=None):
+    from dataclasses import replace
 
-def _run_transport(capture_path, monkeypatch):
-    from transports.ble import BLETransport
-    from utils.config import RACEConfig
-
-    monkeypatch.setattr("transports.ble.BleakClient", _FakeClient)
     config = RACEConfig.cli_defaults()
     if capture_path is not None:
-        from dataclasses import replace
-
         config = replace(config, capture_path=str(capture_path))
 
     async def session():
-        async with BLETransport("AA:BB:CC:DD:EE:FF", config=config) as transport:
+        async with BLETransport(
+            "AA:BB:CC:DD:EE:FF", config=config, client_factory=_FakeClient
+        ) as transport:
             return await transport.send_command(CMD_GET_BUILD)
 
     return asyncio.run(session())
@@ -401,7 +445,7 @@ def test_transport_captures_both_directions(tmp_path, monkeypatch):
     monkeypatch.delenv(CAPTURE_ENV_VAR, raising=False)
     path = tmp_path / "session.pcap"
 
-    payload = _run_transport(path, monkeypatch)
+    payload = _run_transport(path)
     assert payload == FRAME_RX[6:]
 
     tx_record, rx_record = _pcap_records(path)
@@ -417,7 +461,7 @@ def test_transport_honours_capture_environment(tmp_path, monkeypatch):
     path = tmp_path / "env-session.btsnoop"
     monkeypatch.setenv(CAPTURE_ENV_VAR, str(path))
 
-    _run_transport(None, monkeypatch)
+    _run_transport()
 
     tx, rx = _btsnoop_records(path)
     assert _att_fields(tx[3], phdr=0)["value"] == FRAME_TX
@@ -430,24 +474,38 @@ def test_transport_survives_unwritable_capture(tmp_path, monkeypatch):
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("")
     # Capture cannot open -> session must continue without one.
-    assert _run_transport(blocker / "race.pcap", monkeypatch) == FRAME_RX[6:]
+    assert _run_transport(blocker / "race.pcap") == FRAME_RX[6:]
 
 
-def test_transport_ignores_non_byte_frames(tmp_path, monkeypatch):
-    from transports.ble import BLETransport
-    from utils.config import RACEConfig
-
+def test_transport_ignores_non_byte_frames(tmp_path):
     path = tmp_path / "session.pcap"
-    monkeypatch.setattr("transports.ble.BleakClient", _FakeClient)
     config = RACEConfig(capture_path=str(path))
 
     async def session():
-        async with BLETransport("AA:BB:CC:DD:EE:FF", config=config) as transport:
-            # e.g. the coroutine the current notify handler queues by mistake
-            transport._record("rx", object())
+        async with BLETransport(
+            "AA:BB:CC:DD:EE:FF", config=config, client_factory=_FakeClient
+        ) as transport:
+            transport._record("rx", object())  # e.g. an un-awaited coroutine
             transport._record("rx", b"\x05\x01\x02\x00\x08\x1e")
-            return transport
 
     asyncio.run(session())
     (record,) = _pcap_records(path)
     assert _att_fields(record[3])["value"] == b"\x05\x01\x02\x00\x08\x1e"
+
+
+def test_sequential_connections_append_to_one_capture(tmp_path, monkeypatch):
+    # huntandpwn connects per device; the file must accumulate, not truncate.
+    monkeypatch.delenv(CAPTURE_ENV_VAR, raising=False)
+    path = tmp_path / "hunt.pcap"
+
+    _run_transport(path)
+    _run_transport(path)
+
+    records = _pcap_records(path)
+    assert [r[3][PCAP_PHDR_LEN] for r in records] == [H4_ACL_PACKET] * 4
+    assert [att["value"] for att in map(_att_fields, (r[3] for r in records))] == [
+        FRAME_TX,
+        FRAME_RX,
+        FRAME_TX,
+        FRAME_RX,
+    ]

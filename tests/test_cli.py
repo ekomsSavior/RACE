@@ -1,10 +1,21 @@
 """CLI plumbing tests: group-level capture options reach the session config."""
 
+import pytest
 from click.testing import CliRunner
 
 import race
+from tests.test_capture import _att_fields, _pcap_records
+from utils.capture import CAPTURE_ENV_VAR, close_captures
+from utils.packet import CMD_GET_BUILD, build_race_packet
 
 TARGET = "A0:12:34:56:78:90"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_captures():
+    close_captures()
+    yield
+    close_captures()
 
 
 def _invoke(monkeypatch, argv, env=None):
@@ -69,3 +80,17 @@ def test_timeout_and_capture_combine_on_scan(monkeypatch):
     assert result.exit_code == 0, result.output
     assert seen["config"].scan_timeout_s == 3.0
     assert seen["config"].capture_path == "/tmp/scan.pcap"
+
+
+def test_emulate_captures_virtual_traffic(tmp_path, monkeypatch):
+    monkeypatch.delenv(CAPTURE_ENV_VAR, raising=False)
+    path = tmp_path / "virtual.pcap"
+
+    result = CliRunner().invoke(
+        race.cli, ["--capture", str(path), "emulate", "--command", "build"]
+    )
+
+    assert result.exit_code == 0, result.output
+    tx_record, rx_record = _pcap_records(path)
+    assert _att_fields(tx_record[3])["value"] == build_race_packet(CMD_GET_BUILD)
+    assert _att_fields(rx_record[3])["value"].startswith(bytes.fromhex("05 01"))

@@ -13,7 +13,7 @@
 [![Transport](https://img.shields.io/badge/transport-bleak_asyncio-ff9e1b?style=for-the-badge)](#02--system-architecture)
 [![License](https://img.shields.io/badge/license-MIT-2ea043?style=for-the-badge)](LICENSE)
 
-<sub><b>Church of Malware × ek0ms savi0r</b> · Airoha RACE research · 703 LOC · GATT, no pairing, no bonding</sub>
+<sub><b>Church of Malware × ek0ms savi0r</b> · Airoha RACE research · 853 LOC core + offline emulator · GATT, no pairing, no bonding</sub>
 
 </div>
 
@@ -28,13 +28,19 @@
 
 ```bash
 git clone https://github.com/zazieproductions/RACE.git && cd RACE
-sudo apt install -y bluez libbluetooth-dev && pip3 install --user "bleak>=0.22" "click>=8.1" colorama
+sudo apt install -y bluez libbluetooth-dev && pip3 install --user -e .
 
 sudo python3 race.py scan --deep --timeout 15        # enumerate, then verify 0x1200 on name matches
 sudo python3 race.py exploit <MAC> --action dump     # build info → BD_ADDR → flash window
+
+# offline: no radio, no headset, no BLE stack, no real key material
+python3 -m emulator                                  # scripted RACE trace
+python3 -m emulator -i --error build:silent           # interactive fault lab
 ```
 
-<sub>**Index** — [Vulnerability surface](#01--vulnerability-surface) · [Architecture](#02--system-architecture) · [Protocol](#03--protocol-internals) · [Exploit chain](#04--exploit-chain) · [Transport lifecycle](#05--transport-lifecycle) · [Data path](#06--command-data-path) · [Discovery](#07--discovery--targeting) · [Flash map](#08--flash-window--key-material) · [CLI](#10--cli-reference) · [Status](#11--implementation-status)</sub>
+<sub>**Emulator** — [§14](#14--virtual-headphone-emulator) · start with `python3 -m emulator --list-profiles`; the virtual peripheral needs only the Python standard library.</sub>
+
+<sub>**Index** — [Vulnerability surface](#01--vulnerability-surface) · [Architecture](#02--system-architecture) · [Protocol](#03--protocol-internals) · [Exploit chain](#04--exploit-chain) · [Transport lifecycle](#05--transport-lifecycle) · [Data path](#06--command-data-path) · [Discovery](#07--discovery--targeting) · [Flash map](#08--flash-window--key-material) · [CLI](#10--cli-reference) · [Status](#11--implementation-status) · [Emulator](#14--virtual-headphone-emulator)</sub>
 
 ---
 
@@ -146,15 +152,30 @@ flowchart TB
 
 | File | LOC | Responsibility | Public surface |
 |:-----|----:|:---------------|:---------------|
-| `race.py` | 166 | Argument parsing, logging, banner. **No research logic.** | `scan`, `hunt`, `exploit`, `info`, `huntandpwn` |
+| `race.py` | 249 | Argument parsing, logging, banner. **No research logic.** | `scan`, `hunt`, `exploit`, `info`, `huntandpwn`, `emulate` |
 | `utils/config.py` | 53 | Frozen dataclass of protocol constants + timeouts; struct format strings | `RACEConfig`, `frame_header()`, `cmd()` |
 | `utils/packet.py` | 109 | Frame encode/decode, opcode table, typed error hierarchy with codes | `build_race_packet()`, `parse_race_response()`, `RacePacket`, `RACEError` |
-| `transports/ble.py` | 133 | Client lifecycle, service/characteristic resolution, notify drain, request/response correlation | `BLETransport`, `BLETransportError` |
+| `transports/ble.py` | 179 | Client lifecycle, service/characteristic resolution, notify drain, injectable client factory | `BLETransport`, `BLETransportError`, `ClientFactory` |
 | `modules/discovery.py` | 100 | Passive name heuristics + active service probing | `scan_for_targets()`, `aggressive_scan()` |
-| `modules/fingerprint.py` | 24 | Single-shot build-info read | `fingerprint()` |
-| `modules/exploit.py` | 88 | Fingerprint → BD_ADDR → flash window → key candidates | `auto_exploit()`, `struct_pack_flash()` |
+| `modules/fingerprint.py` | 32 | Single-shot build-info read | `fingerprint()` |
+| `modules/exploit.py` | 101 | Fingerprint → BD_ADDR → flash window → key candidates | `auto_exploit()`, `struct_pack_flash()` |
 | `modules/auto_hunter.py` | 30 | Chains discovery into exploitation | `hunt_and_pwn()` |
 | `test_scan.py` | — | Standalone 5-second `BleakScanner` smoke test, no framework imports | — |
+
+### Offline emulation layer (`emulator/`, optional)
+
+The emulator mirrors the bottom two layers without a radio or any third-party dependency. It is not imported by the live path; instead `BLETransport` accepts an injectable `client_factory`, so the *same* transport and modules run against a simulated peripheral. Traffic flows `modules/ → transports/ble.py → emulator/client.py → emulator/device.py`; nothing in `emulator/` imports `bleak`.
+
+| File | LOC | Responsibility | Public surface |
+|:-----|----:|:---------------|:---------------|
+| `emulator/device.py` | 462 | Simulated GATT peripheral: identity, link state, frame parsing, fault application | `VirtualHeadphone`, `DeviceProfile`, `PROFILES`, `load_profile()` |
+| `emulator/responses.py` | 335 | Synthetic build/BD_ADDR/flash/RAM/FOTA payloads and status words | `SyntheticResponder`, `Response`, `KEY_MARKER` |
+| `emulator/client.py` | 179 | bleak-compatible in-process client; schedules notifications on the event loop | `VirtualBleakClient` |
+| `emulator/session.py` | 147 | Raw frame write + collect-all-notifications primitive | `VirtualSession` |
+| `emulator/faults.py` | 260 | Fault rules, probability/count selection, spec parser | `FaultRule`, `FaultPlan`, `FaultKind`, `parse_fault_spec()` |
+| `emulator/explorer.py` | 523 | Scripted/interactive trace UI, frame decoding, hexdump | `Explorer`, `describe_frame()` |
+| `emulator/cli.py` | 343 | Shared `run()` used by `python3 -m emulator` and `race.py emulate` | `run()`, `main()`, `list_profiles()` |
+| `tests/test_emulator.py` | 509 | 51 stdlib-only tests: encoding, faults, transport/module integration, CLI | — |
 
 **Design invariants worth knowing before you patch:**
 
@@ -323,6 +344,7 @@ Every failure carries a stable `code` so callers can branch without string match
 | `NO_RESPONSE` | transport | Nothing queued within `read_timeout_s` | ![mid](https://img.shields.io/badge/-retry_delay-d29922?style=flat-square) |
 | `BAD_RESPONSE` | transport | Reply queued but unparseable | ![mid](https://img.shields.io/badge/-command_aborted-d29922?style=flat-square) |
 | `CLOSED` | transport | Reuse of a torn-down transport | ![high](https://img.shields.io/badge/-caller_bug-e63946?style=flat-square) |
+| `BLEAK_MISSING` | transport | `bleak` is not installed and no `client_factory` was injected | ![low](https://img.shields.io/badge/-use_emulator-2ea043?style=flat-square) |
 
 Hierarchy: `RACEError` → `RACEProtocolError` → `BLETransportError`, so a bare `except RACEProtocolError` catches every malformed-bytes path while leaving radio errors distinguishable. A parallel `RACETransportError` is defined in `utils/packet.py` for call sites that want a transport-typed exception without importing the BLE layer.
 
@@ -389,7 +411,13 @@ tshark -r /tmp/session.pcap -Y btatt -T fields -e btatt.opcode -e btatt.value
 btmon -r /tmp/session.btsnoop
 ```
 
-Records are flushed per frame, so a killed or crashed session still leaves a loadable file. A capture that cannot be opened or written (bad path, full disk) logs a warning and never interrupts the radio session. Only sessions that speak the protocol produce frames — `scan` and `hunt` stop at discovery and never reach the parser.
+One file per run: the sink is shared per path, so `huntandpwn` keeps appending as it walks from device to device instead of truncating on every connection. The same flag works against the [virtual headphone](#14--virtual-headphone-emulator) — no radio needed to exercise the capture path:
+
+```bash
+python3 race.py --capture /tmp/virtual.pcap emulate --action dump
+```
+
+Records are flushed per frame, so a killed or crashed session still leaves a loadable file. A capture that cannot be opened or written (bad path, full disk) logs a warning and never interrupts the session. `scan` and `hunt` stop at discovery and never open a transport, so they produce no file; the emulator's raw explorer is captured alongside the real transport when both run in one invocation.
 
 ---
 
@@ -470,8 +498,8 @@ cd RACE
 sudo apt update
 sudo apt install -y bluez libbluetooth-dev python3-pip
 
-# 3 · python dependencies
-pip3 install --user "bleak>=0.22" "click>=8.1" colorama
+# 3 · python dependencies (live BLE path + click CLI)
+pip3 install --user -e .
 
 # 4 · verify the radio without the framework
 sudo python3 test_scan.py
@@ -488,6 +516,12 @@ chmod +x race.py
 
 Wire capture ([§06](#06--command-data-path)) needs no extra dependency — pcap and btsnoop are written with `struct` from the standard library, so there is no libpcap binding to install.
 
+> [!TIP]
+> The virtual headphone emulator needs **only** the Python standard library:
+> `python3 -m emulator --list-profiles` works on a bare interpreter with no
+> BlueZ, no `bleak`, and no adapter. The three dependencies above are for the
+> live radio path and the `race.py` click front end.
+
 ---
 
 ## 10 · CLI reference
@@ -499,6 +533,7 @@ Wire capture ([§06](#06--command-data-path)) needs no extra dependency — pcap
 | `exploit <target>` | `--action {fingerprint,dump,full}` | `auto_exploit()` | read 5 s |
 | `info <target>` | — | `fingerprint()` | read 5 s |
 | `huntandpwn` | `--timeout` | `hunt_and_pwn()` | 20 s |
+| `emulate` | `--profile`, `--error`, `--command`, `--script`, `-i`, `--action`, `--list-profiles`, `--json` | `emulator` (in-process, no radio) | read 1 s |
 
 Group-level flags (valid on every command, before the subcommand): `--capture PATH` / `RACE_CAPTURE`, `--capture-format {pcap,btsnoop}` / `RACE_CAPTURE_FORMAT`. See [§06](#06--command-data-path).
 
@@ -523,6 +558,12 @@ sudo python3 race.py huntandpwn --timeout 30
 
 # same run, with the wire traffic saved for triage
 sudo python3 race.py --capture /tmp/session.pcap huntandpwn --timeout 30
+
+# offline protocol work: virtual peripheral, synthetic responses, injected faults
+python3 -m emulator --profile generic-airoha
+python3 -m emulator --command build --error build:silent --read-timeout 0.1
+python3 -m emulator --command 'flash 0x1A000' --error flash_read:bad_length
+python3 race.py emulate --action dump
 ```
 
 `--action` and the subcommand set are validated by `click.Choice`, so a typo fails before any radio traffic is generated.
@@ -541,18 +582,22 @@ Honest matrix — what exists, what is a constant, and what is not written yet:
 | BD_ADDR read (`0x0C05`) | `modules/exploit.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
 | Flash page read (`0x0403`) | `modules/exploit.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
 | Automated chain | `modules/auto_hunter.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
+| Virtual RACE peripheral (offline) | `emulator/device.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
+| Synthetic build/BD_ADDR/flash/RAM/FOTA responses | `emulator/responses.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
+| Configurable fault injection | `emulator/faults.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
+| Emulator ↔ real transport/module integration | `transports/ble.py` (`client_factory`) | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
 | Flash write (`0x0404`) | `utils/packet.py` | ![part](https://img.shields.io/badge/opcode_only-d29922?style=flat-square) |
 | RAM read/write (`0x1680`/`0x1681`) | `utils/packet.py` | ![part](https://img.shields.io/badge/opcode_only-d29922?style=flat-square) |
 | FOTA path (head `0x15`) | `utils/config.py` | ![part](https://img.shields.io/badge/constants_only-d29922?style=flat-square) |
-| Wire capture for Wireshark/btmon | `utils/capture.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
+| Wire capture for Wireshark/btmon | `utils/capture.py` (transport + virtual explorer) | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
 | Classic RFCOMM transport | `transports/` | ![todo](https://img.shields.io/badge/planned-6e7681?style=flat-square) |
 | Link-key validation + replay | `modules/exploit.py` | ![todo](https://img.shields.io/badge/stub-6e7681?style=flat-square) |
 | HFP pivot (calls, contacts) | — | ![todo](https://img.shields.io/badge/out_of_scope-6e7681?style=flat-square) |
 
 > [!IMPORTANT]
-> Status above describes **code present in this tree**, verified by reading the call graph — not by a hardware test run. Two gaps are worth knowing before you trust an unattended chain:
+> Status above describes **code present in this tree**, verified by reading the call graph — not by a hardware test run. Two notes before you trust an unattended chain — one now fixed offline, one still open:
 >
-> - **Response plumbing.** `BLETransport._notification_handler` queues the *coroutine* returned by `read_gatt_char()` instead of awaiting it, and ignores the `(sender, data)` arguments that bleak passes to the notify callback. On the current tree a reply therefore reaches `parse_race_response()` as a coroutine object and fails the `bytes` check with `BAD_RESPONSE`. Treat `send_command()` as needing a hardware pass until that is addressed.
+> - **Response plumbing (fixed, verified offline).** The notify handler used to queue the *coroutine* returned by `read_gatt_char()` and ignored bleak's `(sender, data)` arguments, so a real reply could reach `parse_race_response()` as a coroutine. The handler now queues the notification bytes directly and `start_notify()` is awaited. The virtual emulator exercises `BLETransport`, `fingerprint()` and `auto_exploit()` end to end in `tests/test_emulator.py`; a hardware pass is still worth doing for RF-specific behaviour.
 > - **Deep-scan flag.** `scan --deep` is honoured inside `scan_for_targets()`, but `_build_config()` drops its `deep` argument; the flag never reaches `RACEConfig`. It works today only because the module takes it as a separate parameter.
 
 ---
@@ -561,10 +606,25 @@ Honest matrix — what exists, what is a constant, and what is not written yet:
 
 ```
 RACE/
-├── race.py                  # click CLI — presentation only
+├── race.py                  # click CLI — presentation only (+ `emulate`)
 ├── test_scan.py             # 5 s BleakScanner smoke test, dependency-free
+├── pyproject.toml           # packaging, dependencies, ruff/mypy/pytest config
 ├── core/                    # reserved namespace (empty package)
 │   └── __init__.py
+├── emulator/                # virtual headphone: peripheral, faults, explorer
+│   ├── device.py            # simulated GATT device + frame dispatch
+│   ├── responses.py         # synthetic RACE payloads and status words
+│   ├── client.py            # bleak-compatible in-process client
+│   ├── session.py           # raw frame exchange primitive
+│   ├── faults.py            # configurable error injection
+│   ├── explorer.py          # scripted / interactive protocol trace
+│   ├── cli.py               # shared CLI used by `-m emulator` and race.py
+│   └── __main__.py          # `python3 -m emulator`
+├── tests/
+│   ├── test_emulator.py     # 51 stdlib-only emulator/integration tests
+│   ├── test_capture.py      # pcap/btsnoop layout + transport capture hooks
+│   ├── test_cli.py          # group options → session config wiring
+│   └── test_packet.py       # frame codec tests
 ├── modules/
 │   ├── discovery.py         # name heuristic + service probing
 │   ├── fingerprint.py       # 0x1E08 build read
@@ -594,13 +654,180 @@ RACE/
 | Connection stalls | BlueZ D-Bus contention with a phone already paired to the target | Disconnect the paired host, or retry after the advertising window reopens |
 | `Operation not permitted` | Adapter needs raw HCI access | Run with `sudo`, or grant `CAP_NET_RAW` + `CAP_NET_ADMIN` |
 | Scan returns nothing | No discoverable advertisers in range | Increase `--timeout`; BLE advertisers rotate addresses — rescan |
-| Capture file is empty | Session never spoke RACE, or the file was opened by a command without a transport | Use `--capture` with `exploit`/`info`/`huntandpwn`; `scan`/`hunt` only enumerate |
+| No capture file appears | The session never opened a transport (failed connect, or `scan`/`hunt`, which only enumerate) | Use `--capture` with `exploit`/`info`/`huntandpwn`/`emulate`; check the `Wire capture` log line for the resolved path |
+| `BLEAK_MISSING` | `bleak` is absent and the client had no injected factory | `pip3 install -e .`, or run `python3 -m emulator` |
+| `already has a central connected` | Two virtual clients share one `VirtualHeadphone` | Close the first transport/session; the emulator models one central |
+| Emulator shows `-- no response --` | A `silent`, `disconnect` or over-timeout `slow` fault fired | Inspect `faults`, lower `--read-timeout`, or `clear-faults` in the explorer |
 
 **Operational notes.** Passive scanning leaves no trace on the target. Every `connect`, `--deep`, and `hunt` step does: it opens an ATT carrier and is visible in the device's connection log. Budget a scan window before staging; a headset that is actively streaming to a phone typically will not accept a second central.
 
 ---
 
-## 14 · References
+## 14 · Virtual headphone emulator
+
+`emulator/` is an offline RACE peripheral for protocol work: it models the `0x1200` GATT service, answers every implemented opcode with **synthetic** data, and injects faults on demand. There is no radio, no headset, and no access to real key material — though the frames it produces are real enough to capture ([§06](#06--command-data-path)).
+
+### Scope and safety
+
+- **Everything is generated locally.** Build strings start with `EMU`, Classic addresses use documentation-style values, and flash "key" blocks are marked `EMUK` — they are designed to trigger the framework's candidate heuristic, not to resemble credentials.
+- **In-process GATT model, not an OS advertiser.** It reproduces service discovery, characteristic resolution, writes, notifications, delays, malformed frames and dropped links. It does **not** reproduce pairing/bonding, Classic RFCOMM, PHY/MTU negotiation, connection parameters or RF range. Those still need hardware.
+- **No radio side effects.** Nothing in `emulator/` imports `bleak`, opens a socket or touches an adapter; it runs on a bare Python interpreter.
+
+### Entry points
+
+```bash
+python3 -m emulator                                   # scripted trace, stdlib only
+python3 -m emulator --profile generic-airoha --json   # machine-readable report
+python3 -m emulator -i                                # interactive explorer
+python3 -m emulator --list-profiles
+
+python3 race.py emulate                               # same engine, click front end
+python3 race.py emulate --command build --command 'flash 0x1A000'
+python3 race.py emulate --action dump                 # real auto_exploit() over the virtual link
+
+# offline wire capture: replay the virtual link in Wireshark
+python3 race.py --capture /tmp/virtual.pcap emulate --action dump
+```
+
+The trace prints each frame as bytes next to its decoded meaning:
+
+```text
+[build]
+REQ  05 00 02 00 08 1E                                        | request build(0x1E08) len=2 head=0x05
+RSP  05 01 3F 00 08 1E 45 4D 55 20 41 42 31 35 ... (+53 B)    | response build(0x1E08) len=63 head=0x05 | "EMU AB1585 SDK 1.2.3 ... profile=sony-wh1000xm5"
+[bd_addr]
+REQ  05 00 02 00 05 0C                                        | request bd_addr(0x0C05) len=2 head=0x05
+RSP  05 01 08 00 05 0C A0 12 34 56 78 90                      | response bd_addr(0x0C05) len=8 head=0x05 | BD_ADDR A0:12:34:56:78:90
+```
+
+### Profiles
+
+| Key | Advertised name | Address | Notes |
+|:----|:----------------|:--------|:------|
+| `sony-wh1000xm5` | WH-1000XM5 | `A0:12:34:56:78:90` | default; answers every command |
+| `sony-wf1000xm5` | WF-1000XM5 | `A0:12:34:56:78:91` | earbud baseline for timeout exercises |
+| `marshall-major-v` | MAJOR V | `B4:0E:2D:11:22:33` | different seeded flash image |
+| `jbl-live-buds-3` | Live Buds 3 | `C8:5A:CF:44:55:66` | fault-comparison baseline |
+| `bose-qc-earbuds-3` | QuietComfort Earbuds III | `D4:9C:28:77:88:99` | full service table |
+| `generic-airoha` | RACE Reference Design | `E8:9F:6D:AA:BB:CC` | neutral profile for protocol teaching |
+
+Profiles change identity, build banner, RSSI and the seed for synthetic flash content. They do not change the protocol implementation.
+
+### Configurable faults
+
+A fault rule matches an opcode (or every opcode) and changes what the peripheral does. The spec grammar is:
+
+```text
+SPEC := [TARGET:]KIND[:PROBABILITY[#COUNT]]
+TARGET := * | <opcode 0x1E08> | <name: build, flash_read, ...>
+```
+
+| Kind | Wire effect | What the client sees |
+|:-----|:------------|:---------------------|
+| `silent` | no notification at all | `NO_RESPONSE` after `read_timeout_s` |
+| `slow` | valid frame after a delay (`slow:2.5s`; default 6 s) | `NO_RESPONSE` if the delay exceeds the read timeout |
+| `truncate` | response cut to 3 bytes | `BAD_RESPONSE` (`TOO_SHORT` inside) |
+| `bad_head` | head flipped to an unknown value | `BAD_RESPONSE` (`BAD_HEAD`) |
+| `bad_type` | type byte `0x02` | `BAD_RESPONSE` (`BAD_TYPE`) |
+| `bad_length` | length field zeroed | `BAD_RESPONSE` (`BAD_LENGTH`) |
+| `garbage` | 8 non-RACE bytes | `BAD_RESPONSE` (`BAD_HEAD`) |
+| `disconnect` | link dropped, no reply | `NO_RESPONSE`; the next write fails |
+| `status` | valid frame carrying a status word (`status:0x0002`) | caller reads the injected status |
+| `duplicate` | the same frame sent twice | first is consumed; a stale notification stays queued |
+
+```bash
+python3 -m emulator --command build --error build:silent --read-timeout 0.1
+python3 -m emulator --command 'flash 0x1A000' --error flash_read:bad_length
+python3 -m emulator --command 'flash 0x1A000' --error 'flash_read:bad_length:0.5#2'
+python3 -m emulator --command build --error '*:garbage:0.2'
+python3 -m emulator --command build --error '0x0403:slow:2.5s' --read-timeout 1
+python3 -m emulator --error 'flash_read:status:0x0002'
+```
+
+Rules are evaluated in order, first match wins; `PROBABILITY` is drawn per request and `#COUNT` caps how many times a rule may fire. At the interactive prompt, add rules at runtime with `fault 0x1E08:silent`, inspect them with `faults`, and remove them with `clear-faults`. `FaultPlan` uses a seeded RNG, so a session is reproducible unless `--seed` changes it.
+
+### Synthetic response conventions
+
+| Command | Reply payload |
+|:--------|:--------------|
+| Build `0x1E08` | UTF-8 `EMU ...` banner, NUL-terminated |
+| BD_ADDR `0x0C05` | exactly 6 bytes |
+| Flash read `0x0403` | `<status:u16le><offset:u32le><page data>` — a 6-byte prefix, then 256-byte pages |
+| Flash write `0x0404` | `<status:u16le>` |
+| RAM read `0x1680` | `<status:u16le><address:u32le><data>` |
+| RAM write `0x1681` | `<status:u16le>` |
+| FOTA `0x1E0F` | echoes head `0x15`, `<status:u16le>` |
+| Unknown opcode | `<status:u16le>` = `0x0001` (configurable with `answer_unknown=False`) |
+
+Status words: `0x0000` OK · `0x0001` unsupported · `0x0002` out of range · `0x0003` bad request · `0x0004` read-only · `0x7E01` injected fault.
+
+The flash image is 128 KiB of zeros with deterministic `EMUK` + 12-byte blocks at `0x1A020`, `0x1A070` and `0x1B020`, plus settings/calibration markers. `auto_exploit --action dump` therefore reports "Potential Link Key" candidates — that is the heuristic working as designed; the `EMUK` prefix is the proof they are synthetic. Use `--read-only` to reject flash and RAM writes with `READ_ONLY`.
+
+### Explorer commands
+
+| Command | Effect |
+|:--------|:-------|
+| `build`, `bdaddr` | send the corresponding RACE read |
+| `flash OFFSET [COUNT]` | flash page read; e.g. `flash 0x1A000` |
+| `write-flash OFFSET HEX` | flash write; e.g. `write-flash 0x1A020 DEADBEEF` |
+| `ram [ADDR] [LEN]`, `write-ram ADDR HEX` | RAM read/write |
+| `fota [HEX]`, `cmd OPCODE [HEX]`, `send HEX` | raw FOTA, named/numeric opcode, or complete frame |
+| `fault SPEC`, `faults`, `clear-faults` | manage fault injection live |
+| `dump OFFSET [LEN]` | hexdump the local synthetic flash (no radio traffic) |
+| `scan`, `profiles`, `state`, `reset`, `help`, `quit` | inspect the simulation |
+
+`--script FILE` runs the same commands non-interactively, one per line.
+
+### Python API
+
+```python
+import asyncio
+
+from emulator import FaultKind, FaultRule, VirtualHeadphone
+from transports.ble import BLETransport
+from utils.config import RACEConfig
+from utils.packet import CMD_GET_BUILD
+
+
+async def main() -> None:
+    device = VirtualHeadphone(
+        "sony-wh1000xm5",
+        errors=[FaultRule(cmd=CMD_GET_BUILD, kind=FaultKind.SLOW, delay_s=0.1)],
+    )
+    config = RACEConfig(read_timeout_s=0.5)
+    async with BLETransport(
+        device.address,
+        config=config,
+        client_factory=lambda _address: device.client(),
+    ) as transport:
+        print(await transport.send_command(CMD_GET_BUILD))
+
+
+asyncio.run(main())
+```
+
+`client_factory` is a transport-level seam: any object implementing the bleak methods used by `BLETransport` works. `fingerprint()` and `auto_exploit()` accept the same keyword, which is how `race.py emulate --action {fingerprint,dump,full}` exercises the real module code without hardware.
+
+### Tests
+
+```bash
+python3 -m unittest discover -s tests -t . -v
+```
+
+The 51 emulator tests cover frame encoding, every synthetic response, fault selection and effects, service/characteristic failure modes, `BLETransport` integration, `fingerprint()`/`auto_exploit()`, the explorer and the CLI. They use only the standard library — no radio, no `bleak`, no pytest plugin required — and the repository's `pytest` configuration collects them alongside `tests/test_packet.py`.
+
+### Limits
+
+- **Discovery is not emulated.** `scan` and `hunt` still require a real adapter because they enumerate advertisers over HCI. The emulator starts at the GATT connection boundary.
+- **One central at a time.** A second `VirtualBleakClient.connect()` raises while the first is attached, mirroring a headset that already has a phone.
+- **No pairing, bonding or Classic transport.** Those are outside the RACE application protocol.
+- **No ATT fragmentation.** A flash-page reply is delivered as one notification regardless of MTU; a real device fragments at the negotiated ATT MTU, and the client currently assumes a single write.
+- **Timing is event-loop scheduling.** `slow` demonstrates timeout handling; it is not an RF timing model.
+- **Not a hardware substitute.** Synthetic replies prove client logic and protocol handling, not firmware behaviour. Validate conclusions on owned hardware, under authorization.
+
+---
+
+## 15 · References
 
 - [Full disclosure: Bluetooth Headphone Jacking](https://insinuator.net/2025/12/bluetooth-headphone-jacking-full-disclosure-of-airoha-race-vulnerabilities/) — protocol analysis, affected models, coordination timeline
 - [CVE-2025-20700](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2025-20700) · [CVE-2025-20701](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2025-20701) · [CVE-2025-20702](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2025-20702)

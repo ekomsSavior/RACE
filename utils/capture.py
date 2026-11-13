@@ -34,6 +34,8 @@ within a capture.
 
 from __future__ import annotations
 
+import atexit
+import logging
 import os
 import struct
 import time
@@ -43,6 +45,8 @@ from pathlib import Path
 from typing import BinaryIO, Literal
 
 from .packet import RACEError
+
+logger = logging.getLogger("race")
 
 #: Environment variables consulted by :func:`open_capture` when no explicit
 #: value is passed -- lets an existing invocation be captured without edits.
@@ -241,7 +245,7 @@ class WireCapture:
 
     # -- recording ---------------------------------------------------------
 
-    def record(self, direction: Direction, frame: bytes) -> None:
+    def record(self, direction: Direction, frame: bytes | bytearray | memoryview) -> None:
         """Append one frame exactly as it hit the parser / radio."""
         if not isinstance(frame, (bytes, bytearray, memoryview)):
             raise TypeError(f"frame must be bytes-like, got {type(frame).__name__}")
@@ -320,6 +324,13 @@ def _check_handle(value: int, name: str) -> int:
     return value
 
 
+#: Process-wide sinks, keyed by the resolved path.  Sharing one handle is what
+#: lets a hunt across several devices -- or an emulator run that opens both the
+#: real transport and the raw explorer -- append to a single file instead of
+#: truncating it on every connection.
+_captures: dict[str, WireCapture] = {}
+
+
 def open_capture(
     path: str | os.PathLike[str] | None = None,
     fmt: CaptureFormat | str | None = None,
@@ -328,19 +339,57 @@ def open_capture(
     rx_handle: int = ATT_RX_HANDLE,
     clock: Callable[[], float] = time.time,
 ) -> WireCapture | None:
-    """Open a capture from arguments or the environment.
+    """Open, or reuse, the capture for a path.
 
     ``path`` falls back to :data:`CAPTURE_ENV_VAR`, and ``fmt`` falls back to
     :data:`CAPTURE_FORMAT_ENV_VAR` (then to the file extension).  Returns
     ``None`` when neither is set, which is how callers keep the hook optional:
 
         RACE_CAPTURE=/tmp/race.pcap race.py exploit AA:BB:CC:DD:EE:FF
+
+    Repeated calls for the same path return the same sink, so frames from
+    later connections continue the file.  The first call fixes the format.
     """
     target = path if path is not None else os.environ.get(CAPTURE_ENV_VAR) or None
     if target is None:
         return None
+    key = str(Path(target).expanduser())
+    shared = _captures.get(key)
+    if shared is not None:
+        return shared
     if fmt is None:
         fmt = os.environ.get(CAPTURE_FORMAT_ENV_VAR) or None
-    return WireCapture(
-        target, fmt, tx_handle=tx_handle, rx_handle=rx_handle, clock=clock
+    capture = WireCapture(
+        key, fmt, tx_handle=tx_handle, rx_handle=rx_handle, clock=clock
     ).open()
+    _captures[key] = capture
+    return capture
+
+
+def close_captures() -> tuple[WireCapture, ...]:
+    """Flush and close every shared capture, then reset the registry."""
+    captures = tuple(_captures.values())
+    _captures.clear()
+    for capture in captures:
+        capture.close()
+    return captures
+
+
+def tap(capture: WireCapture | None, direction: Direction, frame: object) -> bool:
+    """Best-effort record of one frame; returns True when it reached the file.
+
+    A capture is a diagnostic side channel: a closed file, a full disk, or a
+    caller passing a non-bytes object (e.g. an un-awaited coroutine) must never
+    break the radio session, so failures are logged once per frame instead.
+    """
+    if capture is None or not isinstance(frame, (bytes, bytearray, memoryview)):
+        return False
+    try:
+        capture.record(direction, frame)
+    except CaptureError as exc:
+        logger.warning("Wire capture write failed: %s", exc)
+        return False
+    return True
+
+
+atexit.register(close_captures)
