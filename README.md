@@ -154,14 +154,14 @@ flowchart TB
 
 | File | LOC | Responsibility | Public surface |
 |:-----|----:|:---------------|:---------------|
-| `race.py` | 249 | Argument parsing, logging, banner. **No research logic.** | `scan`, `hunt`, `exploit`, `info`, `huntandpwn`, `emulate` |
-| `utils/config.py` | 53 | Frozen dataclass of protocol constants + timeouts; struct format strings | `RACEConfig`, `frame_header()`, `cmd()` |
-| `utils/packet.py` | 109 | Frame encode/decode, opcode table, typed error hierarchy with codes | `build_race_packet()`, `parse_race_response()`, `RacePacket`, `RACEError` |
-| `transports/ble.py` | 179 | Client lifecycle, service/characteristic resolution, notify drain, injectable client factory | `BLETransport`, `BLETransportError`, `ClientFactory` |
-| `modules/discovery.py` | 100 | Passive name heuristics + active service probing | `scan_for_targets()`, `aggressive_scan()` |
+| `race.py` | 322 | Argument parsing, logging, banner. **No research logic.** | `scan`, `hunt`, `exploit`, `info`, `huntandpwn`, `emulate` |
+| `utils/config.py` | 58 | Frozen dataclass of protocol constants + timeouts; struct format strings | `RACEConfig`, `frame_header()`, `cmd()` |
+| `utils/packet.py` | 169 | Frame encode/decode, opcode table, typed error hierarchy with codes | `build_race_packet()`, `parse_race_response()`, `RacePacket`, `RACEError` |
+| `transports/ble.py` | 337 | Client lifecycle, service/characteristic resolution, notify drain, injectable client factory | `BLETransport`, `BLETransportError`, `ClientFactory` |
+| `modules/discovery.py` | 189 | Passive name heuristics + active service probing | `scan_for_targets()`, `aggressive_scan()` |
 | `modules/fingerprint.py` | 32 | Single-shot build-info read | `fingerprint()` |
-| `modules/exploit.py` | 101 | Fingerprint → BD_ADDR → flash window → key candidates | `auto_exploit()`, `struct_pack_flash()` |
-| `modules/auto_hunter.py` | 30 | Chains discovery into the read-only assessment chain | `hunt_and_pwn()` |
+| `modules/exploit.py` | 244 | Fingerprint → BD_ADDR → flash window → key candidates | `auto_exploit()`, `struct_pack_flash()` |
+| `modules/auto_hunter.py` | 59 | Chains discovery into the read-only assessment chain | `hunt_and_pwn()` |
 | `test_scan.py` | — | Standalone 5-second `BleakScanner` smoke test, no framework imports | — |
 
 ### Offline emulation layer (`emulator/`, optional)
@@ -170,15 +170,15 @@ The emulator mirrors the bottom two layers without a radio or any third-party de
 
 | File | LOC | Responsibility | Public surface |
 |:-----|----:|:---------------|:---------------|
-| `emulator/device.py` | 462 | Simulated GATT peripheral: identity, link state, frame parsing, fault application | `VirtualHeadphone`, `DeviceProfile`, `PROFILES`, `load_profile()` |
+| `emulator/device.py` | 519 | Simulated GATT peripheral: identity, link state, frame parsing, fault application | `VirtualHeadphone`, `DeviceProfile`, `PROFILES`, `load_profile()` |
 | `emulator/responses.py` | 335 | Synthetic build/BD_ADDR/flash/RAM/FOTA payloads and status words | `SyntheticResponder`, `Response`, `KEY_MARKER` |
-| `emulator/client.py` | 179 | bleak-compatible in-process client; schedules notifications on the event loop | `VirtualBleakClient` |
-| `emulator/session.py` | 147 | Frame write + collect-all-notifications primitive; optional fragment reassembly | `VirtualSession` |
-| `emulator/scanner.py` | 68 | Virtual advertiser/scanner for offline discovery | `VirtualScanner`, `VirtualDevice` |
+| `emulator/client.py` | 207 | bleak-compatible in-process client; schedules notifications on the event loop | `VirtualBleakClient` |
+| `emulator/session.py` | 192 | Frame write + collect-all-notifications primitive; optional fragment reassembly | `VirtualSession` |
+| `emulator/scanner.py` | 71 | Virtual advertiser/scanner for offline discovery | `VirtualScanner`, `VirtualDevice` |
 | `emulator/faults.py` | 260 | Fault rules, probability/count selection, spec parser | `FaultRule`, `FaultPlan`, `FaultKind`, `parse_fault_spec()` |
-| `emulator/explorer.py` | 523 | Scripted/interactive trace UI, frame decoding, hexdump | `Explorer`, `describe_frame()` |
-| `emulator/cli.py` | 343 | Shared `run()` used by `python3 -m emulator` and `race.py emulate` | `run()`, `main()`, `list_profiles()` |
-| `tests/test_emulator.py` | 509 | Stdlib-only tests: encoding, faults, fragmentation, discovery, transport/module integration, CLI | — |
+| `emulator/explorer.py` | 524 | Scripted/interactive trace UI, frame decoding, hexdump | `Explorer`, `describe_frame()` |
+| `emulator/cli.py` | 408 | Shared `run()` used by `python3 -m emulator` and `race.py emulate` | `run()`, `main()`, `list_profiles()` |
+| `tests/test_emulator.py` | 850 | Stdlib-only tests: encoding, faults, fragmentation, discovery, transport/module integration, CLI | — |
 
 **Design invariants worth knowing before you patch:**
 
@@ -366,11 +366,14 @@ flowchart LR
     D --> E["notification on RX 0x1202"]:::link
     E --> F["asyncio.Queue<br/>response drain"]:::transport
     F -.->|capture RX, pre-parse| F2["capture RX<br/>raw or malformed"]:::capture
-    F --> G["parse_race_response()<br/>head · type · length · cmd"]:::proto
+    F --> R["FrameAssembler<br/>buffer partial notifications"]:::proto
+    R --> G["parse_race_response()<br/>head · type · length · cmd"]:::proto
     G --> H{"fields valid?"}:::proto
-    H -->|"yes"| I["RacePacket.payload"]:::ok
+    H -->|"yes"| M{"response type<br/>and opcode match?"}:::proto
+    M -->|"yes"| I["RacePacket.payload"]:::ok
+    M -->|"no: discard until deadline"| F
     H -->|"no"| J["BLETransportError<br/>code = BAD_RESPONSE"]:::err
-    I --> K["auto_exploit()<br/>status = success"]:::ok
+    I --> K["caller evaluates payload<br/>and reports result"]:::ok
     J --> K
 
     classDef proto fill:#1d1430,stroke:#9d4edd,color:#ecd9ff,stroke-width:1.5px
@@ -384,7 +387,7 @@ flowchart LR
 
 Two properties shape how you drive it:
 
-- **Request/response pairing is sequential by construction.** `send_command` writes, then `await`s one item from the queue under `read_timeout_s`. There is no per-opcode correlation, so callers must keep commands serial per transport — fire two concurrently and both will consume from the same queue.
+- **Keep commands serial per transport.** `send_command()` drains queued stale data before writing, reassembles notification fragments, and waits for a response with the requested opcode under `read_timeout_s`. Mismatched frames are discarded. There is no lock for concurrent callers: overlapping calls share the queue and assembler. A late reply with the same opcode arriving after the new write remains indistinguishable from the new response.
 - **Payload, not frame.** Callers never see head, type, or length bytes — the parser strips them and hands back `payload` only. That is why `auto_exploit` can slice `raw[:6]` for the BD_ADDR without arithmetic.
 
 ### Wire capture — replay the session in Wireshark
@@ -623,7 +626,7 @@ Honest matrix — what exists, what is a constant, and what is not written yet:
 ```
 RACE/
 ├── race.py                  # click CLI — presentation only (+ `emulate`)
-├── test_scan.py             # 5 s BleakScanner smoke test, dependency-free
+├── test_scan.py             # 5 s BleakScanner smoke test; requires bleak
 ├── pyproject.toml           # packaging, dependencies, ruff/mypy/pytest config
 ├── core/                    # reserved namespace (empty package)
 │   └── __init__.py
@@ -642,7 +645,9 @@ RACE/
 │   ├── test_capture.py      # pcap/btsnoop layout + transport capture hooks
 │   ├── test_cli.py          # group options → session config wiring
 │   ├── test_discovery.py    # RSSI reporting + probe-failure handling
-│   └── test_packet.py       # frame codec tests
+│   ├── test_packet.py       # frame codec tests
+│   ├── test_packet_fuzz.py  # fixed-seed parser/assembler fuzz tests
+│   └── test_review_regressions.py # capture safety, lifecycle and CLI timeout
 ├── modules/
 │   ├── discovery.py         # name heuristic + service probing
 │   ├── fingerprint.py       # 0x1E08 build read
@@ -888,7 +893,7 @@ The coverage threshold measures `utils/` and `emulator/`, not the whole framewor
 ## 16 · Credits
 
 - **Original RACE framework:** [ek0ms savi0r (@ekomsSavior)](https://github.com/ekomsSavior) and [Church of Malware](https://churchofmalware.org/).
-- **Major upgrade and documentation:** [Zazie Productions (@zazieproductions)](https://github.com/zazieproductions), whose [RACE fork](https://github.com/zazieproductions/RACE) contributed the architecture refactor, offline headphone emulator, wire capture, CI and packaging, and this README's diagrams and technical walkthrough. His original commits are retained in the merged history.
+- **Major upgrade and documentation:** [Zazie Productions (@zazieproductions)](https://github.com/zazieproductions), whose [RACE fork](https://github.com/zazieproductions/RACE) contributed the architecture refactor, offline headphone emulator, wire capture, CI and packaging, and this README's diagrams and technical walkthrough. His original commits are retained in the [GitHub merge history](https://github.com/ekomsSavior/RACE/pull/3).
 - **Underlying vulnerability research:** the researchers credited in the [original disclosure](https://insinuator.net/2025/12/bluetooth-headphone-jacking-full-disclosure-of-airoha-race-vulnerabilities/).
 
 ---
