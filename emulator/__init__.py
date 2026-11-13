@@ -26,6 +26,7 @@ from .client import VirtualBleakClient
 from .device import DeviceProfile, TraceEntry, VirtualHeadphone, load_profile
 from .faults import FaultKind, FaultPlan, FaultRule, FaultSpecError, parse_fault_spec
 from .responses import SyntheticResponder
+from .scanner import VirtualAdvertisement, VirtualDevice, VirtualScanner
 from .session import VirtualSession
 
 __all__ = [
@@ -36,8 +37,11 @@ __all__ = [
     "FaultSpecError",
     "SyntheticResponder",
     "TraceEntry",
+    "VirtualAdvertisement",
     "VirtualBleakClient",
+    "VirtualDevice",
     "VirtualHeadphone",
+    "VirtualScanner",
     "VirtualSession",
     "load_profile",
     "parse_fault_spec",

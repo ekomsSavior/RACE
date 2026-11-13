@@ -82,6 +82,65 @@ def build_race_packet(
     return header + cmd_bytes + payload
 
 
+class FrameAssembler:
+    """Incrementally reassemble RACE frames from ATT notification fragments.
+
+    A GATT notification carries at most ``ATT_MTU - 3`` bytes.  The default
+    ATT MTU is 23, so a normal RACE response is commonly split over several
+    notifications.  The assembler buffers bytes until a complete frame is
+    available and can return several frames from one notification.
+
+    Header fields are validated as soon as four bytes are available, so a
+    corrupt head/type or an impossible length fails fast instead of waiting
+    for a timeout.  An incomplete frame is kept in :attr:`pending_bytes`; the
+    transport reports that as a truncated response when its read deadline
+    expires.
+    """
+
+    def __init__(self, config: RACEConfig | None = None) -> None:
+        self.config = config or RACEConfig()
+        self._buffer = bytearray()
+
+    @property
+    def pending_bytes(self) -> bytes:
+        """Bytes held for an incomplete frame."""
+        return bytes(self._buffer)
+
+    def reset(self) -> None:
+        """Discard any buffered partial frame."""
+        self._buffer.clear()
+
+    def feed(self, chunk: bytes | bytearray | memoryview) -> list[bytes]:
+        """Append *chunk* and return every complete frame now available."""
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise TypeError("chunk must be bytes-like")
+        self._buffer.extend(chunk)
+        frames: list[bytes] = []
+
+        while len(self._buffer) >= 4:
+            head, ptype, length = struct.unpack_from("<BBH", self._buffer, 0)
+            if head not in (self.config.head_standard, self.config.head_fota):
+                raise RACEProtocolError(
+                    f"Unexpected frame head 0x{head:02X}", code="BAD_HEAD"
+                )
+            if ptype not in (0x00, 0x01):
+                raise RACEProtocolError(
+                    f"Invalid frame type 0x{ptype:02X}", code="BAD_TYPE"
+                )
+            if length < 2:
+                raise RACEProtocolError(
+                    "Length field smaller than CMD(2B)", code="BAD_LENGTH"
+                )
+
+            total = 4 + length
+            if len(self._buffer) < total:
+                break
+            frames.append(bytes(self._buffer[:total]))
+            del self._buffer[:total]
+
+        return frames
+
+
 def parse_race_response(data: bytes, *, config: RACEConfig | None = None) -> RacePacket:
     """Parse a RACE response into a validated :class:`RacePacket`."""
     config = config or RACEConfig()

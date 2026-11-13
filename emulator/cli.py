@@ -77,6 +77,13 @@ def _print_header(
         f"{device.responder.page_size} B/page, "
         f"{len(KEY_BLOCK_OFFSETS)} synthetic key block(s)"
     )
+    if device.att_mtu is None:
+        out("  ATT MTU      unfragmented (emulator default)")
+    else:
+        out(
+            f"  ATT MTU      {device.att_mtu} "
+            f"({device.notification_size} B notification payload)"
+        )
     out(f"  read timeout {read_timeout:g}s")
     out("")
 
@@ -109,6 +116,16 @@ async def _run_action(
             f"[+] auto_exploit finished: build={result.get('build')!r} "
             f"bd_addr={result.get('bd_addr')}"
         )
+        flash = result.get("flash") or {}
+        if flash.get("status") == "ok":
+            candidates = flash.get("key_candidates") or []
+            out(
+                f"    flash read 0x{flash['offset']:05X}: "
+                f"{flash['data_bytes']} B, "
+                f"{len(candidates)} unvalidated key candidate(s)"
+            )
+        else:
+            out("    flash read was not part of this action")
     else:
         out(f"[-] auto_exploit failed: {result.get('message')}")
     out("")
@@ -136,6 +153,8 @@ async def run(
     seed: int | None = None,
     read_only: bool = False,
     json_output: bool = False,
+    att_mtu: int | None = None,
+    discover: bool = False,
     config: RACEConfig | None = None,
     out: Out = print,
 ) -> int:
@@ -160,13 +179,18 @@ async def run(
             out(f"[!] invalid --error {spec!r}: {exc}")
             return 2
 
-    device = VirtualHeadphone(
-        profile_obj,
-        errors=rules,
-        slow_response_s=slow_seconds,
-        fault_seed=0 if seed is None else seed,
-        read_only=read_only,
-    )
+    try:
+        device = VirtualHeadphone(
+            profile_obj,
+            errors=rules,
+            slow_response_s=slow_seconds,
+            fault_seed=0 if seed is None else seed,
+            read_only=read_only,
+            att_mtu=att_mtu,
+        )
+    except ValueError as exc:
+        out(f"[!] {exc}")
+        return 2
 
     if read_timeout <= 0:
         out("[!] --read-timeout must be positive")
@@ -185,6 +209,22 @@ async def run(
 
     action_ok = True
     try:
+        if discover:
+            from modules.discovery import scan_for_targets
+
+            from .scanner import VirtualScanner
+
+            out("[*] running scan_for_targets() over the virtual advertisement")
+            results = await scan_for_targets(
+                session_config,
+                deep_scan=True,
+                scanner=VirtualScanner.from_headphones([device]),
+                client_factory=lambda _address: device.client(),
+                out=out,
+            )
+            out(f"[+] discovery found {len(results)} device(s)")
+            out("")
+
         if action:
             action_ok = await _run_action(
                 device, action, config=session_config, out=out
@@ -307,6 +347,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="reject flash/RAM writes with a READ_ONLY status",
     )
     parser.add_argument(
+        "--discover",
+        action="store_true",
+        help="exercise scan_for_targets() over the virtual advertisement",
+    )
+    parser.add_argument(
+        "--mtu",
+        type=int,
+        default=None,
+        metavar="BYTES",
+        help=(
+            "emulate ATT MTU fragmentation (23 is the BLE default; "
+            "omit for one notification per frame)"
+        ),
+    )
+    parser.add_argument(
         "--json",
         dest="json_output",
         action="store_true",
@@ -335,6 +390,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 seed=args.seed,
                 read_only=args.read_only,
                 json_output=args.json_output,
+                att_mtu=args.mtu,
+                discover=args.discover,
             )
         )
     except KeyboardInterrupt:
