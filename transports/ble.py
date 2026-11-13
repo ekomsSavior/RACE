@@ -17,14 +17,22 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-try:  # bleak is optional for the offline emulator path
-    from bleak import BleakClient as _BleakClient
-except ImportError:  # pragma: no cover - exercised on machines without bleak
-    _BleakClient = None
-
 from utils.capture import CaptureError, Direction, WireCapture, open_capture, tap
 from utils.config import RACEConfig
 from utils.packet import RACEProtocolError, build_race_packet, parse_race_response
+
+
+def _bleak_client() -> Any:
+    """Return bleak's client class, or ``None`` when bleak is not installed."""
+    try:
+        from bleak import BleakClient
+    except ImportError:  # pragma: no cover - exercised on machines without bleak
+        return None
+    return BleakClient
+
+
+#: bleak is optional for the offline emulator path.
+_BleakClient = _bleak_client()
 
 logger = logging.getLogger("race")
 
@@ -64,7 +72,7 @@ class BLETransport:
         self.address = address
         self.config = config or RACEConfig()
         self._client_factory = client_factory
-        self._client: Any | None = None
+        self._client: Any = None
         self._tx_char = None
         self._rx_char = None
         self._response_queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -150,8 +158,16 @@ class BLETransport:
         return tx, rx
 
     def _notification_handler(self, _sender: Any, data: Any) -> None:
-        """Queue the notification payload (bleak passes ``sender, data``)."""
-        self._response_queue.put_nowait(bytes(data))
+        """Capture and queue a notification payload (bleak passes ``sender, data``).
+
+        Recording happens here, at arrival, rather than when a command dequeues
+        the frame: duplicates, unsolicited notifications and replies that land
+        after ``read_timeout_s`` all reach the file, stamped with the time they
+        actually arrived instead of the time the next command consumed them.
+        """
+        payload = bytes(data)
+        self._record("rx", payload)
+        self._response_queue.put_nowait(payload)
 
     async def send_command(self, cmd: int, payload: bytes = b"") -> bytes:
         """Send a RACE command and return the validated response payload."""
@@ -167,10 +183,6 @@ class BLETransport:
             )
         except asyncio.TimeoutError:
             raise BLETransportError("No RACE response within timeout", code="NO_RESPONSE") from None
-
-        # Capture before validation so malformed/failing replies are on disk
-        # even when BAD_RESPONSE is what ends the session.
-        self._record("rx", raw)
 
         try:
             return parse_race_response(raw).payload
