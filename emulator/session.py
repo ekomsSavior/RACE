@@ -3,9 +3,9 @@
 :class:`VirtualSession` sends raw frames and collects *every* notification
 produced for that write, including duplicates and delayed replies.  It is the
 primitive behind the explorer; it deliberately does not reuse
-:class:`transports.ble.BLETransport` because that transport consumes exactly
-one notification per command and hides malformed frames behind a single
-error.  Researchers exploring faults need to see the raw bytes.
+:class:`transports.ble.BLETransport` because that transport correlates one
+response and hides malformed/stale frames behind a single error.  Researchers
+exploring faults need to see the raw bytes, optionally before reassembly.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from utils.capture import CaptureError, Direction, WireCapture, open_capture, tap
 from utils.config import RACEConfig
-from utils.packet import build_race_packet
+from utils.packet import FrameAssembler, RACEProtocolError, build_race_packet
 
 from .client import VirtualBleakClient
 
@@ -37,6 +37,7 @@ class VirtualSession:
         read_timeout: float = 1.0,
         settle_s: float = 0.02,
         config: RACEConfig | None = None,
+        reassemble: bool = True,
     ) -> None:
         if read_timeout <= 0:
             raise ValueError("read_timeout must be positive")
@@ -44,6 +45,7 @@ class VirtualSession:
         self.config = config or device.config
         self.read_timeout = read_timeout
         self.settle_s = max(0.0, settle_s)
+        self.reassemble = reassemble
         self.client = VirtualBleakClient(device)
         self._frames: list[bytes] = []
         self._event = asyncio.Event()
@@ -123,7 +125,29 @@ class VirtualSession:
         if self.settle_s:
             # Give duplicate/immediate notifications a chance to land.
             await asyncio.sleep(self.settle_s)
-        return list(self._frames)
+        chunks = list(self._frames)
+        return self._join_fragments(chunks) if self.reassemble else chunks
+
+    def _join_fragments(self, chunks: list[bytes]) -> list[bytes]:
+        """Join notification fragments while preserving malformed raw frames.
+
+        The explorer deliberately displays bad frames rather than hiding them,
+        so a header error falls back to the original chunk and resets the
+        assembler.  Trailing bytes at the end of the settle window are returned
+        as-is (a truncated frame is diagnostic information).
+        """
+        assembler = FrameAssembler(self.config)
+        frames: list[bytes] = []
+        for chunk in chunks:
+            try:
+                frames.extend(assembler.feed(chunk))
+            except RACEProtocolError:
+                frames.append(chunk)
+                assembler.reset()
+        pending = assembler.pending_bytes
+        if pending:
+            frames.append(pending)
+        return frames
 
     async def send_command(
         self,

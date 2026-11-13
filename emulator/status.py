@@ -1,9 +1,11 @@
 """Status words used by the synthetic RACE peripheral.
 
 The real protocol returns a little-endian status word for commands that do
-not have a data payload (flash write, RAM write, FOTA).  The emulator uses
-the same shape and reserves ``0x7E01`` for injected faults so a faulted
-reply is distinguishable from a genuine command failure.
+not have a data payload (flash write, RAM write, FOTA).  The emulator models
+that shape, but the numeric assignments below are **conventions chosen for
+this simulator**, not vendor protocol truth.  ``0x7E01`` is deliberately
+reserved for injected faults so a faulted reply is distinguishable from a
+genuine command failure.
 """
 
 from __future__ import annotations

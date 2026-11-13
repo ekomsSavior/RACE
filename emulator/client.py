@@ -121,18 +121,36 @@ class VirtualBleakClient:
                 return char
         return SimCharacteristic(self._device.config.rx_uuid)
 
-    def _deliver(self, frame: bytes) -> None:
+    def _fragments(self, frame: bytes) -> list[bytes]:
+        """Split *frame* at the emulated ATT MTU, if one is configured."""
+        size = self._device.notification_size
+        if size is None or len(frame) <= size:
+            return [frame]
+        return [frame[index : index + size] for index in range(0, len(frame), size)]
+
+    def _deliver_chunk(self, chunk: bytes) -> None:
         if not self.is_connected:
             return
         uuid = self._device.config.rx_uuid.lower()
-        payload = bytearray(frame)
-        self._last_value[uuid] = bytes(frame)
+        payload = bytearray(chunk)
+        self._last_value[uuid] = bytes(chunk)
         for handler in list(self._handlers.get(uuid, ())):
             try:
                 handler(self._notify_characteristic(), payload)
             except Exception:
                 # A broken observer must not take down the virtual link.
                 continue
+
+    def _deliver(self, frame: bytes) -> None:
+        """Deliver one response, fragmented into ATT-sized notifications.
+
+        Chunks are delivered in order from the same callback.  Real
+        notifications are separate events, but a single event-loop turn is
+        enough for both the transport's frame assembler and the explorer's
+        settle window, and it keeps tests deterministic.
+        """
+        for chunk in self._fragments(frame):
+            self._deliver_chunk(chunk)
 
     # ------------------------------------------------------------------
     # GATT I/O
@@ -151,7 +169,16 @@ class VirtualBleakClient:
                 f"characteristic {uuid} is not the RACE TX characteristic"
             )
 
-        outbounds = self._device.handle_request(bytes(data))
+        raw = bytes(data)
+        size = self._device.notification_size
+        if size is None:
+            outbounds = self._device.handle_request(raw)
+        elif len(raw) <= size:
+            outbounds = self._device.handle_write(raw)
+        else:
+            outbounds = []
+            for index in range(0, len(raw), size):
+                outbounds.extend(self._device.handle_write(raw[index : index + size]))
         if not self._device.connected:
             self._connected = False
             return

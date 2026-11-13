@@ -69,7 +69,7 @@ def hex_bytes(data: bytes, limit: int = 14) -> str:
 def _status_from(payload: bytes) -> int | None:
     if len(payload) < 2:
         return None
-    return struct.unpack_from("<H", payload, 0)[0]
+    return int(struct.unpack_from("<H", payload, 0)[0])
 
 
 def describe_response(pkt: RacePacket) -> str:
@@ -89,7 +89,8 @@ def describe_response(pkt: RacePacket) -> str:
     if cmd == CMD_READ_FLASH:
         if len(payload) == 2:
             status = _status_from(payload)
-            return f"status 0x{status:04X} ({status_name(status)})"
+            if status is not None:
+                return f"status 0x{status:04X} ({status_name(status)})"
         if len(payload) >= 6:
             status, offset = struct.unpack_from("<HI", payload, 0)
             return (

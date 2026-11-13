@@ -185,9 +185,14 @@ class VirtualHeadphone:
         slow_response_s: float = 6.0,
         answer_unknown: bool = True,
         read_only: bool = False,
+        att_mtu: int | None = None,
     ) -> None:
         self.profile = load_profile(profile) if isinstance(profile, str) else profile
         self.config = config or RACEConfig()
+
+        if att_mtu is not None and not 4 <= att_mtu <= 517:
+            raise ValueError("att_mtu must be between 4 and 517")
+        self.att_mtu = att_mtu
 
         self.expose_service = expose_service
         self.expose_tx = expose_tx
@@ -209,6 +214,10 @@ class VirtualHeadphone:
         self.connected = False
         self.stats = DeviceStats()
         self.trace: list[TraceEntry] = []
+        # Virtual GATT long-write reassembly: the client chunks a request at
+        # ATT MTU - 3, the peripheral joins the chunks before dispatching one
+        # logical RACE request.
+        self._write_buffer = bytearray()
         self._service = build_race_service(
             self.config,
             expose_tx=self.expose_tx,
@@ -259,6 +268,18 @@ class VirtualHeadphone:
     def tx_available(self) -> bool:
         return self.expose_service and self.expose_tx
 
+    @property
+    def notification_size(self) -> int | None:
+        """Maximum notification payload (``ATT_MTU - 3``), or ``None``.
+
+        ``None`` keeps the emulator's historical one-notification-per-frame
+        behaviour; an explicit MTU (23 is the BLE default) fragments responses
+        exactly as a real link would.
+        """
+        if self.att_mtu is None:
+            return None
+        return self.att_mtu - 3
+
     # ------------------------------------------------------------------
     # Link lifecycle
     # ------------------------------------------------------------------
@@ -272,6 +293,7 @@ class VirtualHeadphone:
         self.trace.append(TraceEntry("note", note="central connected"))
 
     def disconnect(self) -> None:
+        self._write_buffer.clear()
         if self.connected:
             self.connected = False
             self.trace.append(TraceEntry("note", note="central disconnected"))
@@ -279,6 +301,37 @@ class VirtualHeadphone:
     # ------------------------------------------------------------------
     # Request handling
     # ------------------------------------------------------------------
+    def handle_write(self, data: bytes) -> list[Outbound]:
+        """Reassemble a possibly-fragmented ATT write, then dispatch it.
+
+        The virtual client splits requests larger than ``ATT_MTU - 3``.  This
+        method buffers those chunks and calls :meth:`handle_request` once a
+        complete frame is available.  A malformed header is handed to
+        ``handle_request`` immediately so it is counted and ignored, matching
+        the direct-write behaviour.
+        """
+        self._write_buffer.extend(data)
+        if len(self._write_buffer) < 4:
+            return []
+
+        head, ptype, length = struct.unpack_from("<BBH", self._write_buffer, 0)
+        if (
+            ptype != FRAME_TYPE_REQUEST
+            or head not in (self.config.head_standard, self.config.head_fota)
+            or length < 2
+        ):
+            malformed = bytes(self._write_buffer)
+            self._write_buffer.clear()
+            return self.handle_request(malformed)
+
+        total = 4 + length
+        if len(self._write_buffer) < total:
+            return []
+
+        frame = bytes(self._write_buffer[:total])
+        del self._write_buffer[:total]
+        return self.handle_request(frame)
+
     def handle_request(self, data: bytes) -> list[Outbound]:
         """Process one written request frame and return pending notifications.
 
@@ -412,6 +465,7 @@ class VirtualHeadphone:
 
     def reset(self) -> None:
         """Reset counters, fault counters and the synthetic memory image."""
+        self._write_buffer.clear()
         self.reset_stats()
         self.fault_plan.reset()
         self.responder.regenerate()
@@ -430,6 +484,8 @@ class VirtualHeadphone:
             "expose_service": self.expose_service,
             "expose_tx": self.expose_tx,
             "expose_rx": self.expose_rx,
+            "att_mtu": self.att_mtu,
+            "notification_size": self.notification_size,
             "stats": {
                 "connections": self.stats.connections,
                 "requests": self.stats.requests,

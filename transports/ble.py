@@ -17,14 +17,20 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from utils.capture import CaptureError, Direction, WireCapture, open_capture, tap
+from utils.config import RACEConfig
+from utils.packet import (
+    FrameAssembler,
+    RACEProtocolError,
+    build_race_packet,
+    parse_race_response,
+)
+
+_BleakClient: Any
 try:  # bleak is optional for the offline emulator path
     from bleak import BleakClient as _BleakClient
 except ImportError:  # pragma: no cover - exercised on machines without bleak
     _BleakClient = None
-
-from utils.capture import CaptureError, Direction, WireCapture, open_capture, tap
-from utils.config import RACEConfig
-from utils.packet import RACEProtocolError, build_race_packet, parse_race_response
 
 logger = logging.getLogger("race")
 
@@ -68,6 +74,11 @@ class BLETransport:
         self._tx_char = None
         self._rx_char = None
         self._response_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        # ATT notifications may contain a fragment of a RACE frame.  The
+        # assembler joins them; complete frames sit in ``_assembled`` until a
+        # command consumes or discards them (stale/duplicate replies).
+        self._assembler = FrameAssembler(self.config)
+        self._assembled: list[bytes] = []
         self._closed = False
         # Optional pcap/btsnoop sink; opened on connect, released on disconnect.
         # The file itself is process-wide (see utils.capture.open_capture), so a
@@ -93,6 +104,8 @@ class BLETransport:
 
         factory = self._client_factory or _default_client_factory
         self._client = factory(self.address)
+        self._assembler.reset()
+        self._assembled.clear()
         try:
             await self._client.connect(timeout=self.config.connect_timeout_s)
 
@@ -134,7 +147,10 @@ class BLETransport:
             await self.connect()
 
     def _resolve_service(self):
-        for service in self._client.services:
+        client = self._client
+        if client is None:
+            return None
+        for service in client.services:
             if service.uuid.lower() == self.config.service_uuid.lower():
                 return service
         return None
@@ -153,31 +169,107 @@ class BLETransport:
         """Queue the notification payload (bleak passes ``sender, data``)."""
         self._response_queue.put_nowait(bytes(data))
 
+    def _discard_pending(self) -> None:
+        """Drop notifications/partial frames that predate the next write."""
+        while True:
+            try:
+                raw = self._response_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._record("rx", raw)
+        self._assembler.reset()
+        self._assembled.clear()
+
     async def send_command(self, cmd: int, payload: bytes = b"") -> bytes:
-        """Send a RACE command and return the validated response payload."""
+        """Send a RACE command and return the *matching* response payload.
+
+        Notifications are not a one-to-one reply channel: a device can emit
+        unsolicited frames, duplicate a reply, or deliver a late answer for the
+        previous command.  Notifications that predate this write are drained
+        (and captured) first, then every complete frame is correlated by
+        response opcode; mismatched/unsolicited frames are discarded until the
+        deadline.  A trailing partial frame is reported as a truncated reply.
+        """
         await self._ensure_connected()
+        client = self._client
+        if client is None:
+            raise BLETransportError("Transport is not connected", code="NOT_CONNECTED")
+
+        # A late reply to a previous command can carry the same opcode we are
+        # about to send.  Correlation by opcode cannot distinguish it, so
+        # discard everything that arrived before this write.  Stale bytes are
+        # still tapped into the capture: they were on the wire.
+        self._discard_pending()
 
         packet = build_race_packet(cmd, payload, head=self.config.head_standard)
         self._record("tx", packet)
-        await self._client.write_gatt_char(self._tx_char, packet, response=True)
+        # Outbound fragmentation/long writes are the BLE stack's job: this
+        # layer hands one RACE frame to write_gatt_char.  Inbound notifications
+        # arrive one ATT PDU at a time, so reassembly is done above.
+        await client.write_gatt_char(self._tx_char, packet, response=True)
 
-        try:
-            raw = await asyncio.wait_for(
-                self._response_queue.get(), timeout=self.config.read_timeout_s
-            )
-        except asyncio.TimeoutError:
-            raise BLETransportError("No RACE response within timeout", code="NO_RESPONSE") from None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.config.read_timeout_s
+        discarded = 0
 
-        # Capture before validation so malformed/failing replies are on disk
-        # even when BAD_RESPONSE is what ends the session.
-        self._record("rx", raw)
+        while True:
+            while self._assembled:
+                raw_frame = self._assembled.pop(0)
+                try:
+                    parsed = parse_race_response(raw_frame, config=self.config)
+                except RACEProtocolError as exc:
+                    raise BLETransportError(
+                        f"Invalid response for cmd 0x{cmd:04X}: {exc}",
+                        code="BAD_RESPONSE",
+                    ) from exc
 
-        try:
-            return parse_race_response(raw).payload
-        except RACEProtocolError as exc:
+                if parsed.is_response() and parsed.cmd == cmd:
+                    return parsed.payload
+
+                discarded += 1
+                logger.warning(
+                    "Discarding %s frame cmd=0x%04X while waiting for cmd=0x%04X",
+                    "response" if parsed.is_response() else "request",
+                    parsed.cmd,
+                    cmd,
+                )
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                raw = await asyncio.wait_for(
+                    self._response_queue.get(), timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                break
+
+            # Capture before validation so malformed/failing replies are on
+            # disk even when BAD_RESPONSE is what ends the session.
+            self._record("rx", raw)
+            try:
+                self._assembled.extend(self._assembler.feed(raw))
+            except RACEProtocolError as exc:
+                raise BLETransportError(
+                    f"Invalid response for cmd 0x{cmd:04X}: {exc}",
+                    code="BAD_RESPONSE",
+                ) from exc
+
+        if self._assembler.pending_bytes:
             raise BLETransportError(
-                f"Invalid response for cmd 0x{cmd:04X}: {exc}", code="BAD_RESPONSE"
-            ) from exc
+                "Incomplete response within timeout "
+                f"({len(self._assembler.pending_bytes)} byte(s) buffered)",
+                code="BAD_RESPONSE",
+            )
+        if discarded:
+            raise BLETransportError(
+                f"No matching RACE response for cmd 0x{cmd:04X} within timeout; "
+                f"discarded {discarded} mismatched/unsolicited frame(s)",
+                code="NO_RESPONSE",
+            )
+        raise BLETransportError(
+            "No RACE response within timeout", code="NO_RESPONSE"
+        )
 
     async def disconnect(self) -> None:
         if self._closed:
@@ -190,6 +282,8 @@ class BLETransport:
             self._client = None
             self._tx_char = None
             self._rx_char = None
+            self._assembler.reset()
+            self._assembled.clear()
             self._close_capture()
 
     # -- wire capture ------------------------------------------------------

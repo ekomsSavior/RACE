@@ -70,11 +70,20 @@ def _build_config(ctx: click.Context, *, timeout: int | None = None) -> RACEConf
 
 def _console_result(status: str, result: dict[str, Any]) -> None:
     if status == "success":
-        logger.info("Exploit successful")
+        logger.info("Exploit read chain completed (no impersonation claim)")
         if "build" in result:
             logger.info("Build: %s", result["build"])
         if "bd_addr" in result:
             logger.info("BD_ADDR: %s", result["bd_addr"])
+        flash = result.get("flash") or {}
+        if flash.get("status") == "ok":
+            candidates = flash.get("key_candidates") or []
+            logger.info(
+                "Flash: 0x%05X (%d B), %d unvalidated key candidate(s)",
+                flash["offset"],
+                flash["data_bytes"],
+                len(candidates),
+            )
     else:
         logger.error("Exploit failed: %s", result.get("message", "Unknown error"))
 
@@ -197,7 +206,7 @@ def info(ctx: click.Context, target_address: str) -> None:
 )
 @click.pass_context
 def huntandpwn(ctx: click.Context, timeout: int) -> None:
-    """Auto-hunt and exploit all RACE devices."""
+    """Auto-hunt and assess all RACE devices (read-only chain)."""
     config = _build_config(ctx, timeout=timeout)
     asyncio.run(hunt_and_pwn(config))
 
@@ -250,6 +259,17 @@ def huntandpwn(ctx: click.Context, timeout: int) -> None:
     is_flag=True,
     help="Print a JSON device report after the session.",
 )
+@click.option(
+    "--mtu",
+    type=int,
+    default=None,
+    help="Emulate ATT MTU fragmentation (23 is the BLE default).",
+)
+@click.option(
+    "--discover",
+    is_flag=True,
+    help="Exercise scan_for_targets() over the virtual advertisement.",
+)
 @click.pass_context
 def emulate(
     ctx: click.Context,
@@ -261,6 +281,8 @@ def emulate(
     action: str | None,
     list_profiles: bool,
     json_output: bool,
+    mtu: int | None,
+    discover: bool,
 ) -> None:
     """Explore RACE against a virtual headphone (no radio, no hardware)."""
     if list_profiles:
@@ -276,6 +298,8 @@ def emulate(
             interactive=interactive,
             action=action,
             json_output=json_output,
+            att_mtu=mtu,
+            discover=discover,
             config=_build_config(ctx),
             out=click.echo,
         )
