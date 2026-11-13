@@ -210,7 +210,7 @@ def info(ctx: click.Context, target_address: str) -> None:
 def huntandpwn(ctx: click.Context, timeout: int) -> None:
     """Auto-hunt and exploit all RACE devices."""
     config = _build_config(ctx, timeout=timeout)
-    asyncio.run(hunt_and_pwn(config))
+    asyncio.run(hunt_and_pwn(config, timeout=timeout))
 
 
 @cli.command()

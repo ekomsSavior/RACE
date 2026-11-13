@@ -96,6 +96,8 @@ class BLETransport:
 
     async def connect(self) -> None:
         """Connect, resolve service/characteristic handles, then start notify."""
+        if self._closed:
+            raise BLETransportError("Transport has been closed", code="CLOSED")
         if self.is_connected:
             return
 

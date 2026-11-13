@@ -37,6 +37,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import stat
 import struct
 import time
 from collections.abc import Callable
@@ -217,15 +218,16 @@ class WireCapture:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             # 0600 up front: captures carry raw device data, including possible
             # key material, so the process umask must not decide who can read it.
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT, CAPTURE_FILE_MODE)
+            fd = _open_capture_fd(self.path)
         except OSError as exc:
             raise CaptureError(
                 f"Cannot open capture {self.path}: {exc}", code="CAPTURE_OPEN"
             ) from exc
 
         try:
-            os.chmod(self.path, CAPTURE_FILE_MODE)
             _lock(fd)  # refuse to truncate a file another run is writing
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, CAPTURE_FILE_MODE)
             os.ftruncate(fd, 0)
             fh = os.fdopen(fd, "wb")
         except CaptureError:
@@ -335,6 +337,36 @@ class WireCapture:
         usec = int((timestamp - sec) * 1_000_000)
         header = struct.pack("<IIII", sec, usec, len(data), orig_len + PCAP_PHDR_LEN)
         return header + data
+
+
+def _open_capture_fd(path: Path) -> int:
+    """Open a regular, singly linked file without following a path substitution."""
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        before = None
+    if before is not None and (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1):
+        raise CaptureError(
+            "Capture path must be a regular, singly linked file", code="CAPTURE_OPEN"
+        )
+
+    flags = os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if before is None:
+        # Fail if another process creates the path after lstat().
+        flags |= os.O_CREAT | os.O_EXCL
+    fd = os.open(path, flags, CAPTURE_FILE_MODE)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise CaptureError(
+                "Capture file must be regular and singly linked", code="CAPTURE_OPEN"
+            )
+        if before is not None and (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise CaptureError("Capture path changed while opening", code="CAPTURE_OPEN")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _lock(fd: int) -> None:
