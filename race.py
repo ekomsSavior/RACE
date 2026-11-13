@@ -13,7 +13,7 @@ import logging
 from typing import Any
 
 import click
-from colorama import init, Fore, Style
+from colorama import Fore, Style, init
 
 from modules.auto_hunter import hunt_and_pwn
 from modules.discovery import aggressive_scan, scan_for_targets
@@ -36,10 +36,10 @@ BANNER = f"""\
 {Fore.RED}
 {Fore.YELLOW}  Bluetooth Headphone Jacking Framework
 {Fore.CYAN}  Church of Malware x ek0ms savi0r
-{Fore.RED}  {'='*55}
+{Fore.RED}  {"=" * 55}
 {Fore.WHITE}  Research: Airoha RACE Vulnerabilities
 {Fore.WHITE}  CVEs: 2025-20700, 2025-20701, 2025-20702
-{Fore.RED}  {'='*55}{Style.RESET_ALL}
+{Fore.RED}  {"=" * 55}{Style.RESET_ALL}
 """
 
 

@@ -1,11 +1,17 @@
+"""Manual BLE scanner smoke test; requires a Bluetooth adapter."""
+
 import asyncio
+
 from bleak import BleakScanner
 
-async def test():
+
+async def scan_devices() -> None:
     print("[*] Scanning for 5 seconds...")
     devices = await BleakScanner.discover(timeout=5)
-    for d in devices:
-        print(f"  {d.address} - {d.name}")
+    for device in devices:
+        print(f"  {device.address} - {device.name}")
     print("[+] Scan complete")
 
-asyncio.run(test())
+
+if __name__ == "__main__":
+    asyncio.run(scan_devices())

@@ -15,13 +15,13 @@ from dataclasses import dataclass
 from .config import RACEConfig
 
 # RACE command opcodes (from the project documentation).
-CMD_GET_BUILD = 0x1E08      # Get Build Version
-CMD_READ_FLASH = 0x0403     # Read Flash
-CMD_WRITE_FLASH = 0x0404    # Write Flash
-CMD_GET_BD_ADDR = 0x0C05    # Get Bluetooth Classic address
-CMD_GET_RAM = 0x1680        # Read RAM
-CMD_SET_RAM = 0x1681        # Write RAM
-CMD_FOTA = 0x1E0F           # FOTA start (Head 0x15)
+CMD_GET_BUILD = 0x1E08  # Get Build Version
+CMD_READ_FLASH = 0x0403  # Read Flash
+CMD_WRITE_FLASH = 0x0404  # Write Flash
+CMD_GET_BD_ADDR = 0x0C05  # Get Bluetooth Classic address
+CMD_GET_RAM = 0x1680  # Read RAM
+CMD_SET_RAM = 0x1681  # Write RAM
+CMD_FOTA = 0x1E0F  # FOTA start (Head 0x15)
 
 INVALID_PACKET = "Invalid RACE packet"
 TOO_SHORT = "Packet too short"
@@ -91,7 +91,8 @@ def parse_race_response(data: bytes, *, config: RACEConfig | None = None) -> Rac
     head, ptype, length = _unpack_header(data)
     if head not in (config.head_standard, config.head_fota):
         raise RACEProtocolError(
-            f"Unexpected frame head 0x{head:02X} (expected 0x{config.head_standard:02X} or 0x{config.head_fota:02X})",
+            f"Unexpected frame head 0x{head:02X} (expected 0x{config.head_standard:02X} "
+            f"or 0x{config.head_fota:02X})",
             code="BAD_HEAD",
         )
     if ptype not in (0x00, 0x01):
