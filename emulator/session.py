@@ -11,8 +11,10 @@ error.  Researchers exploring faults need to see the raw bytes.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING
 
+from utils.capture import CaptureError, Direction, WireCapture, open_capture, tap
 from utils.config import RACEConfig
 from utils.packet import build_race_packet
 
@@ -20,6 +22,9 @@ from .client import VirtualBleakClient
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .device import VirtualHeadphone
+
+
+logger = logging.getLogger("race")
 
 
 class VirtualSession:
@@ -43,6 +48,9 @@ class VirtualSession:
         self._frames: list[bytes] = []
         self._event = asyncio.Event()
         self._open = False
+        # The explorer sees frames before any parser touches them, so a capture
+        # taken here includes malformed and duplicate replies as they arrived.
+        self._capture: WireCapture | None = None
 
     async def __aenter__(self) -> VirtualSession:
         await self.open()
@@ -58,6 +66,7 @@ class VirtualSession:
         if self.device.rx_available:
             await self.client.start_notify(self.config.rx_uuid, self._on_notify)
         self._open = True
+        self._capture = self._open_capture()
 
     async def close(self) -> None:
         if not self._open:
@@ -65,7 +74,18 @@ class VirtualSession:
         self._open = False
         await self.client.disconnect()
 
+    def _open_capture(self) -> WireCapture | None:
+        try:
+            return open_capture(self.config.capture_path, self.config.capture_format)
+        except (CaptureError, OSError) as exc:
+            logger.warning("Wire capture disabled: %s", exc)
+            return None
+
+    def _record(self, direction: Direction, frame: bytes) -> None:
+        tap(self._capture, direction, frame)
+
     def _on_notify(self, _sender, data: bytearray) -> None:
+        self._record("rx", bytes(data))
         self._frames.append(bytes(data))
         self._event.set()
 
@@ -89,6 +109,7 @@ class VirtualSession:
 
         self._frames = []
         self._event.clear()
+        self._record("tx", frame)
         await self.client.write_gatt_char(self.config.tx_uuid, frame, response=True)
 
         wait_for = self.read_timeout if timeout is None else timeout

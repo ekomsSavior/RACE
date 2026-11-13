@@ -16,6 +16,7 @@ import asyncio
 import json
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from utils.config import RACEConfig
@@ -84,7 +85,7 @@ async def _run_action(
     device: VirtualHeadphone,
     action: str,
     *,
-    read_timeout: float,
+    config: RACEConfig,
     out: Out,
 ) -> bool:
     """Run the framework's real exploit module over the virtual GATT link."""
@@ -96,11 +97,10 @@ async def _run_action(
         return False
 
     out(f"[*] exercising the real auto_exploit(..., action={action!r}) path")
-    cfg = RACEConfig(read_timeout_s=read_timeout)
     result = await auto_exploit(
         device.address,
         action,
-        cfg,
+        config,
         client_factory=lambda _address: device.client(),
     )
     status = result.get("status")
@@ -136,9 +136,14 @@ async def run(
     seed: int | None = None,
     read_only: bool = False,
     json_output: bool = False,
+    config: RACEConfig | None = None,
     out: Out = print,
 ) -> int:
-    """Run an emulator session.  Returns a process-style exit code."""
+    """Run an emulator session.  Returns a process-style exit code.
+
+    ``config`` carries caller settings (notably the wire-capture path) into the
+    transport and explorer; ``read_timeout`` is applied on top of it.
+    """
     try:
         from .device import load_profile
 
@@ -167,6 +172,7 @@ async def run(
         out("[!] --read-timeout must be positive")
         return 2
 
+    session_config = replace(config or device.config, read_timeout_s=read_timeout)
     _print_header(device, read_timeout=read_timeout, out=out)
 
     lines: list[str] = []
@@ -181,7 +187,7 @@ async def run(
     try:
         if action:
             action_ok = await _run_action(
-                device, action, read_timeout=read_timeout, out=out
+                device, action, config=session_config, out=out
             )
 
         should_explore = interactive or bool(lines) or not action
@@ -191,7 +197,9 @@ async def run(
                 out("[*] running the default exploration script")
                 out("")
 
-            explorer = Explorer(device, out=out, read_timeout=read_timeout)
+            explorer = Explorer(
+                device, out=out, read_timeout=read_timeout, config=session_config
+            )
             await explorer.open()
             try:
                 if lines:
