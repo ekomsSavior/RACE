@@ -13,21 +13,23 @@
 [![Transport](https://img.shields.io/badge/transport-bleak_asyncio-ff9e1b?style=for-the-badge)](#02--system-architecture)
 [![License](https://img.shields.io/badge/license-MIT-2ea043?style=for-the-badge)](LICENSE)
 
-<sub><b>Church of Malware × ek0ms savi0r</b> · Airoha RACE research · 853 LOC core + offline emulator · GATT, no pairing, no bonding</sub>
+<sub><b>Church of Malware × ek0ms savi0r</b> · Airoha RACE research · modular core + offline emulator · GATT, no pairing, no bonding</sub>
+
+**Major upgrade and README by [Zazie Productions (@zazieproductions)](https://github.com/zazieproductions).**
 
 </div>
 
 ---
 
 > [!CAUTION]
-> **Authorized testing only.** Every technique documented here is an *active* radio interaction: connecting to a peer is observable by the device and by anything monitoring the piconet. Use it on hardware you own or have written permission to assess. No warranty — see [LICENSE](LICENSE).
+> **Authorized testing only.** Live-device commands make *active* radio interactions: connecting to a peer is observable by the device and by anything monitoring the piconet. Use them on hardware you own or have written permission to assess. The offline emulator uses synthetic data and no radio. No warranty — see [LICENSE](LICENSE).
 
 ---
 
 ## 00 · Quick start
 
 ```bash
-git clone https://github.com/zazieproductions/RACE.git && cd RACE
+git clone https://github.com/ekomsSavior/RACE.git && cd RACE
 sudo apt install -y bluez libbluetooth-dev && pip3 install --user -e .
 
 sudo python3 race.py scan --deep --timeout 15        # enumerate, then verify 0x1200 on name matches
@@ -164,7 +166,7 @@ flowchart TB
 
 ### Offline emulation layer (`emulator/`, optional)
 
-The emulator mirrors the bottom two layers without a radio or any third-party dependency. It is not imported by the live path; instead `BLETransport` accepts an injectable `client_factory`, so the *same* transport and modules run against a simulated peripheral. Traffic flows `modules/ → transports/ble.py → emulator/client.py → emulator/device.py`; nothing in `emulator/` imports `bleak`.
+The emulator mirrors the bottom two layers without a radio or any third-party dependency. `BLETransport` accepts an injectable `client_factory`, so the *same* transport and modules run against a simulated peripheral. Traffic flows `modules/ → transports/ble.py → emulator/client.py → emulator/device.py`; nothing in `emulator/` imports `bleak`.
 
 | File | LOC | Responsibility | Public surface |
 |:-----|----:|:---------------|:---------------|
@@ -408,6 +410,7 @@ Three behavioural details matter when you read a capture back:
 - **Responses are recorded at arrival, not at dequeue.** Duplicates, unsolicited notifications and replies that land after `read_timeout_s` all reach the file, stamped with the time they actually arrived — they are not silently dropped, and they are not attributed to whichever command happened to consume them later.
 - **The file is `0600` from creation and is not sanitised.** A capture contains every byte the device returned, including the flash window in `--action dump` and therefore candidate link-key material. Treat it like key material: no tickets, no public issues, no shared volumes.
 - **One writer per path.** A second process opening a capture another run still holds fails with `CAPTURE_LOCKED` instead of truncating the live file; within a process the sink is shared, so a multi-device hunt appends. Broken sinks log once per file and failure kind, not once per frame.
+- **Use a regular file in a trusted directory.** Capture output rejects symlinks, hard links, special files, and detected path substitutions with `CAPTURE_OPEN`. An existing, unlocked regular file is still overwritten when a new run opens it; choose a fresh filename to retain earlier captures.
 
 ```bash
 # just the RACE frames, as hex + opcode, no GUI
@@ -499,7 +502,7 @@ Key harvesting is heuristic, and intentionally conservative:
 
 ```bash
 # 1 · clone
-git clone https://github.com/zazieproductions/RACE.git
+git clone https://github.com/ekomsSavior/RACE.git
 cd RACE
 
 # 2 · system dependencies (BlueZ headers + HCI tooling)
@@ -518,9 +521,9 @@ chmod +x race.py
 
 | Dependency | Role | Absent → |
 |:-----------|:-----|:---------|
-| `bleak` | Async BLE GATT client over BlueZ/D-Bus | no transport at all |
+| `bleak` | Async BLE GATT client over BlueZ/D-Bus | live BLE unavailable; standalone emulator still works |
 | `click` | Command group, options, `--action` choice validation | CLI won't import |
-| `colorama` | Banner + inline ANSI, cross-terminal | plain, uncoloured output |
+| `colorama` | Banner + inline ANSI, cross-terminal | `race.py` won't import; standalone emulator uses plain output |
 
 Wire capture ([§06](#06--command-data-path)) needs no extra dependency — pcap and btsnoop are written with `struct` from the standard library, so there is no libpcap binding to install.
 
@@ -604,10 +607,12 @@ Honest matrix — what exists, what is a constant, and what is not written yet:
 | HFP pivot (calls, contacts) | — | ![todo](https://img.shields.io/badge/out_of_scope-6e7681?style=flat-square) |
 
 > [!IMPORTANT]
-> Status above describes **code present in this tree**, verified by reading the call graph — not by a hardware test run. Two notes before you trust an unattended chain — one now fixed offline, one still open:
+> Status above describes **code present in this tree**, verified by reading the call graph — not by a hardware test run. Important implementation details:
 >
 > - **Response plumbing (fixed, verified offline).** The notify handler used to queue the *coroutine* returned by `read_gatt_char()` and ignored bleak's `(sender, data)` arguments, so a real reply could reach `parse_race_response()` as a coroutine. The handler now queues the notification bytes directly and `start_notify()` is awaited. The virtual emulator exercises `BLETransport`, `fingerprint()` and `auto_exploit()` end to end in `tests/test_emulator.py`; a hardware pass is still worth doing for RF-specific behaviour.
-> - **Deep-scan flag.** `scan --deep` is honoured inside `scan_for_targets()`, but `_build_config()` drops its `deep` argument; the flag never reaches `RACEConfig`. It works today only because the module takes it as a separate parameter.
+> - **Discovery options.** `scan --deep` is passed directly to `scan_for_targets()`; it is intentionally separate from `RACEConfig`. The `huntandpwn --timeout` value reaches the discovery call.
+> - **Single-use transport.** After `disconnect()` or context-manager exit, create a new `BLETransport`; reopening a closed instance raises `CLOSED` before opening another connection.
+> - **Response validation limits.** The parser still accepts request-type frames and ignores trailing bytes, and the transport does not correlate replies with the requested command. Offline test success does not establish correctness under delayed, duplicated, fragmented, or unsolicited device responses.
 
 ---
 
@@ -823,10 +828,21 @@ asyncio.run(main())
 ### Tests
 
 ```bash
-python3 -m unittest discover -s tests -t . -v
+python3 -m unittest tests.test_emulator -v
 ```
 
 The 51 emulator tests cover frame encoding, every synthetic response, fault selection and effects, service/characteristic failure modes, `BLETransport` integration, `fingerprint()`/`auto_exploit()`, the explorer and the CLI. They use only the standard library — no radio, no `bleak`, no pytest plugin required — and the repository's `pytest` configuration collects them alongside `tests/test_packet.py`.
+
+For the complete offline suite, including capture safety, CLI options, and transport lifecycle regression checks:
+
+```bash
+python3 -m pip install -e '.[dev]'
+python3 -m pytest
+ruff check .
+mypy
+```
+
+The coverage threshold measures `utils/`, not the whole framework. CI runs the suite on Linux and macOS with Python 3.10 and 3.12; real-device compatibility requires separate hardware testing.
 
 ### Limits
 
@@ -845,6 +861,14 @@ The 51 emulator tests cover frame encoding, every synthetic response, fault sele
 - [CVE-2025-20700](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2025-20700) · [CVE-2025-20701](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2025-20701) · [CVE-2025-20702](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2025-20702)
 - [bleak](https://github.com/hbldh/bleak) — cross-platform BLE GATT client
 - [BlueZ](https://www.bluez.org/) — Linux Bluetooth stack
+
+---
+
+## 16 · Credits
+
+- **Original RACE framework:** [ek0ms savi0r (@ekomsSavior)](https://github.com/ekomsSavior) and [Church of Malware](https://churchofmalware.org/).
+- **Major upgrade and documentation:** [Zazie Productions (@zazieproductions)](https://github.com/zazieproductions), whose [RACE fork](https://github.com/zazieproductions/RACE) contributed the architecture refactor, offline headphone emulator, wire capture, CI and packaging, and this README's diagrams and technical walkthrough. His original commits are retained in the merged history.
+- **Underlying vulnerability research:** the researchers credited in the [original disclosure](https://insinuator.net/2025/12/bluetooth-headphone-jacking-full-disclosure-of-airoha-race-vulnerabilities/).
 
 ---
 
