@@ -161,7 +161,7 @@ flowchart TB
 | `modules/discovery.py` | 100 | Passive name heuristics + active service probing | `scan_for_targets()`, `aggressive_scan()` |
 | `modules/fingerprint.py` | 32 | Single-shot build-info read | `fingerprint()` |
 | `modules/exploit.py` | 101 | Fingerprint → BD_ADDR → flash window → key candidates | `auto_exploit()`, `struct_pack_flash()` |
-| `modules/auto_hunter.py` | 30 | Chains discovery into exploitation | `hunt_and_pwn()` |
+| `modules/auto_hunter.py` | 30 | Chains discovery into the read-only assessment chain | `hunt_and_pwn()` |
 | `test_scan.py` | — | Standalone 5-second `BleakScanner` smoke test, no framework imports | — |
 
 ### Offline emulation layer (`emulator/`, optional)
@@ -173,11 +173,12 @@ The emulator mirrors the bottom two layers without a radio or any third-party de
 | `emulator/device.py` | 462 | Simulated GATT peripheral: identity, link state, frame parsing, fault application | `VirtualHeadphone`, `DeviceProfile`, `PROFILES`, `load_profile()` |
 | `emulator/responses.py` | 335 | Synthetic build/BD_ADDR/flash/RAM/FOTA payloads and status words | `SyntheticResponder`, `Response`, `KEY_MARKER` |
 | `emulator/client.py` | 179 | bleak-compatible in-process client; schedules notifications on the event loop | `VirtualBleakClient` |
-| `emulator/session.py` | 147 | Raw frame write + collect-all-notifications primitive | `VirtualSession` |
+| `emulator/session.py` | 147 | Frame write + collect-all-notifications primitive; optional fragment reassembly | `VirtualSession` |
+| `emulator/scanner.py` | 68 | Virtual advertiser/scanner for offline discovery | `VirtualScanner`, `VirtualDevice` |
 | `emulator/faults.py` | 260 | Fault rules, probability/count selection, spec parser | `FaultRule`, `FaultPlan`, `FaultKind`, `parse_fault_spec()` |
 | `emulator/explorer.py` | 523 | Scripted/interactive trace UI, frame decoding, hexdump | `Explorer`, `describe_frame()` |
 | `emulator/cli.py` | 343 | Shared `run()` used by `python3 -m emulator` and `race.py emulate` | `run()`, `main()`, `list_profiles()` |
-| `tests/test_emulator.py` | 509 | 51 stdlib-only tests: encoding, faults, transport/module integration, CLI | — |
+| `tests/test_emulator.py` | 509 | Stdlib-only tests: encoding, faults, fragmentation, discovery, transport/module integration, CLI | — |
 
 **Design invariants worth knowing before you patch:**
 
@@ -343,8 +344,8 @@ Every failure carries a stable `code` so callers can branch without string match
 | `BAD_LENGTH` | parser | Length `< 2` or payload overruns the frame | ![low](https://img.shields.io/badge/-response_dropped-f4a261?style=flat-square) |
 | `SERVICE_NOT_FOUND` | transport | Peer connected but exposes no `0x1200` | ![mid](https://img.shields.io/badge/-target_skipped-d29922?style=flat-square) |
 | `TX_NOT_FOUND` | transport | Service present, write characteristic missing | ![mid](https://img.shields.io/badge/-target_skipped-d29922?style=flat-square) |
-| `NO_RESPONSE` | transport | Nothing queued within `read_timeout_s` | ![mid](https://img.shields.io/badge/-retry_delay-d29922?style=flat-square) |
-| `BAD_RESPONSE` | transport | Reply queued but unparseable | ![mid](https://img.shields.io/badge/-command_aborted-d29922?style=flat-square) |
+| `NO_RESPONSE` | transport | Nothing usable within `read_timeout_s`; may include only stale/duplicate/unsolicited frames | ![mid](https://img.shields.io/badge/-retry_delay-d29922?style=flat-square) |
+| `BAD_RESPONSE` | transport | Reply unparseable, or only a partial frame arrived before the deadline | ![mid](https://img.shields.io/badge/-command_aborted-d29922?style=flat-square) |
 | `CLOSED` | transport | Reuse of a torn-down transport | ![high](https://img.shields.io/badge/-caller_bug-e63946?style=flat-square) |
 | `BLEAK_MISSING` | transport | `bleak` is not installed and no `client_factory` was injected | ![low](https://img.shields.io/badge/-use_emulator-2ea043?style=flat-square) |
 
@@ -476,21 +477,21 @@ flowchart TD
 
 ## 08 · Flash window & key material
 
-`struct_pack_flash(offset)` emits `[0x00][count:u16le=1][offset:u32le]` — seven payload bytes, thirteen on the wire. Four offsets are attempted, and the loop stops at the first reply that parses:
+`struct_pack_flash(offset)` emits `[0x00][count:u16le=1][offset:u32le]` — seven payload bytes, thirteen on the wire. Four offsets are attempted. A failed or data-less read is recorded and the loop continues; it stops only at the first reply that actually carries page data:
 
 | Page | Offset | Request | Read strategy | Expected content |
 |:-----|:-------|:--------|:--------------|:-----------------|
-| P0 | `0x1A000` | `count=1` | first successful read confirms the primitive; loop exits here | primary extraction window in public research |
+| P0 | `0x1A000` | `count=1` | first successful data read confirms the primitive; loop exits here | primary extraction window in public research |
 | P1 | `0x1B000` | `count=1` | same descriptor, incremented offset | settings + key material on some SDKs |
 | P2 | `0x1C000` | `count=1` | — | calibration blobs |
 | P3 | `0x1D000` | `count=1` | — | calibration blobs |
 
-Page size is **firmware-defined**, not fixed by the protocol: `count` selects pages, not bytes, and the caller receives whatever the device returns for that region. The exploit only requires a reply longer than 10 bytes to start scanning, so it makes no assumption about a 4 KiB geometry.
+Page size is **firmware-defined**, not fixed by the protocol: `count` selects pages, not bytes, and the caller receives whatever the device returns for that region. The exploit only requires a reply longer than 10 bytes to start scanning, so it makes no assumption about a 4 KiB geometry. If all four reads fail or return no data, `auto_exploit()` returns `status="error"` with the per-offset failures — it does not fall through to a success result.
 
 Key harvesting is heuristic, and intentionally conservative:
 
 1. Take the transport payload (frame head, type, length and CMD are already stripped by `parse_race_response`).
-2. Skip 6 further bytes (`raw[6:]`), then stride 16 bytes across that slice while the index stays below `min(len(data) - 16, 256)`.
+2. Skip 6 further bytes (`payload[6:]`), then stride 16 bytes across that slice while the index stays below `min(len(data), 256) - 15`.
 3. Flag any stride whose first 8 bytes are all non-zero — a cheap entropy proxy, not a validated key.
 
 > [!TIP]
@@ -544,7 +545,7 @@ Wire capture ([§06](#06--command-data-path)) needs no extra dependency — pcap
 | `exploit <target>` | `--action {fingerprint,dump,full}` | `auto_exploit()` | read 5 s |
 | `info <target>` | — | `fingerprint()` | read 5 s |
 | `huntandpwn` | `--timeout` | `hunt_and_pwn()` | 20 s |
-| `emulate` | `--profile`, `--error`, `--command`, `--script`, `-i`, `--action`, `--list-profiles`, `--json` | `emulator` (in-process, no radio) | read 1 s |
+| `emulate` | `--profile`, `--error`, `--command`, `--script`, `-i`, `--action`, `--list-profiles`, `--json`, `--mtu`, `--discover` | `emulator` (in-process, no radio) | read 1 s |
 
 Group-level flags (valid on every command, before the subcommand): `--capture PATH` / `RACE_CAPTURE`, `--capture-format {pcap,btsnoop}` / `RACE_CAPTURE_FORMAT`. See [§06](#06--command-data-path).
 
@@ -561,10 +562,10 @@ sudo python3 race.py exploit A0:12:34:56:78:90 --action fingerprint
 # add BD_ADDR + flash window
 sudo python3 race.py exploit A0:12:34:56:78:90 --action dump
 
-# full chain including impersonation stage
+# read chain + candidate listing; no impersonation claim
 sudo python3 race.py exploit A0:12:34:56:78:90 --action full
 
-# discovery → exploitation, unattended
+# discovery → assessment, unattended
 sudo python3 race.py huntandpwn --timeout 30
 
 # same run, with the wire traffic saved for triage
@@ -572,6 +573,7 @@ sudo python3 race.py --capture /tmp/session.pcap huntandpwn --timeout 30
 
 # offline protocol work: virtual peripheral, synthetic responses, injected faults
 python3 -m emulator --profile generic-airoha
+python3 -m emulator --mtu 23 --command 'flash 0x1A000'   # ATT-sized fragments
 python3 -m emulator --command build --error build:silent --read-timeout 0.1
 python3 -m emulator --command 'flash 0x1A000' --error flash_read:bad_length
 python3 race.py emulate --action dump
@@ -609,10 +611,10 @@ Honest matrix — what exists, what is a constant, and what is not written yet:
 > [!IMPORTANT]
 > Status above describes **code present in this tree**, verified by reading the call graph — not by a hardware test run. Important implementation details:
 >
-> - **Response plumbing (fixed, verified offline).** The notify handler used to queue the *coroutine* returned by `read_gatt_char()` and ignored bleak's `(sender, data)` arguments, so a real reply could reach `parse_race_response()` as a coroutine. The handler now queues the notification bytes directly and `start_notify()` is awaited. The virtual emulator exercises `BLETransport`, `fingerprint()` and `auto_exploit()` end to end in `tests/test_emulator.py`; a hardware pass is still worth doing for RF-specific behaviour.
+> - **Response plumbing and correlation (fixed, verified offline).** Notifications are queued as raw bytes and reassembled across ATT fragments. `send_command()` correlates a complete frame by response opcode, drains stale frames before each write, and raises `NO_RESPONSE` if only mismatched frames arrived. The virtual emulator exercises `BLETransport`, `fingerprint()` and `auto_exploit()` end to end in `tests/test_emulator.py`; a hardware pass is still worth doing for RF-specific behaviour.
 > - **Discovery options.** `scan --deep` is passed directly to `scan_for_targets()`; it is intentionally separate from `RACEConfig`. The `huntandpwn --timeout` value reaches the discovery call.
 > - **Single-use transport.** After `disconnect()` or context-manager exit, create a new `BLETransport`; reopening a closed instance raises `CLOSED` before opening another connection.
-> - **Response validation limits.** The parser still accepts request-type frames and ignores trailing bytes, and the transport does not correlate replies with the requested command. Offline test success does not establish correctness under delayed, duplicated, fragmented, or unsolicited device responses.
+> - **Response validation limits.** The standalone parser accepts request-type frames and ignores trailing bytes; the transport checks response type and opcode after reassembly. A delayed reply with the same opcode arriving after a new write cannot be distinguished by opcode alone. Offline test success does not establish firmware or radio compatibility.
 
 ---
 
@@ -629,13 +631,14 @@ RACE/
 │   ├── device.py            # simulated GATT device + frame dispatch
 │   ├── responses.py         # synthetic RACE payloads and status words
 │   ├── client.py            # bleak-compatible in-process client
-│   ├── session.py           # raw frame exchange primitive
+│   ├── session.py           # frame exchange primitive + fragment reassembly
+│   ├── scanner.py           # virtual advertiser/scanner for offline discovery
 │   ├── faults.py            # configurable error injection
 │   ├── explorer.py          # scripted / interactive protocol trace
 │   ├── cli.py               # shared CLI used by `-m emulator` and race.py
 │   └── __main__.py          # `python3 -m emulator`
 ├── tests/
-│   ├── test_emulator.py     # 51 stdlib-only emulator/integration tests
+│   ├── test_emulator.py     # stdlib-only emulator/integration tests
 │   ├── test_capture.py      # pcap/btsnoop layout + transport capture hooks
 │   ├── test_cli.py          # group options → session config wiring
 │   ├── test_discovery.py    # RSSI reporting + probe-failure handling
@@ -701,6 +704,8 @@ python3 -m emulator --list-profiles
 python3 race.py emulate                               # same engine, click front end
 python3 race.py emulate --command build --command 'flash 0x1A000'
 python3 race.py emulate --action dump                 # real auto_exploit() over the virtual link
+python3 -m emulator --mtu 23 --command 'flash 0x1A000' # ATT MTU 23 → 20 B fragments
+python3 -m emulator --discover                          # scan_for_targets() over a virtual advertiser
 
 # offline wire capture: replay the virtual link in Wireshark
 python3 race.py --capture /tmp/virtual.pcap emulate --action dump
@@ -750,7 +755,7 @@ TARGET := * | <opcode 0x1E08> | <name: build, flash_read, ...>
 | `garbage` | 8 non-RACE bytes | `BAD_RESPONSE` (`BAD_HEAD`) |
 | `disconnect` | link dropped, no reply | `NO_RESPONSE`; the next write fails |
 | `status` | valid frame carrying a status word (`status:0x0002`) | caller reads the injected status |
-| `duplicate` | the same frame sent twice | first is consumed; a stale notification stays queued |
+| `duplicate` | the same frame sent twice | first is consumed; the second is recognised as stale by opcode correlation and discarded on the next command |
 
 ```bash
 python3 -m emulator --command build --error build:silent --read-timeout 0.1
@@ -778,7 +783,10 @@ Rules are evaluated in order, first match wins; `PROBABILITY` is drawn per reque
 
 Status words: `0x0000` OK · `0x0001` unsupported · `0x0002` out of range · `0x0003` bad request · `0x0004` read-only · `0x7E01` injected fault.
 
-The flash image is 128 KiB of zeros with deterministic `EMUK` + 12-byte blocks at `0x1A020`, `0x1A070` and `0x1B020`, plus settings/calibration markers. `auto_exploit --action dump` therefore reports "Potential Link Key" candidates — that is the heuristic working as designed; the `EMUK` prefix is the proof they are synthetic. Use `--read-only` to reject flash and RAM writes with `READ_ONLY`.
+> [!IMPORTANT]
+> **These are emulator conventions, not protocol truth.** The status-word assignments, the 6-byte `status + offset` flash prefix, the fixed 256-byte page size, the `MAX_PAGES_PER_READ`/`MAX_RAM_READ` limits and every payload layout above were chosen to make the client testable. They are not asserted as the vendor firmware layout, and passing against the emulator does not validate a real device. Only the frame envelope (head/type/length/cmd), the opcodes used here and the captured public research are treated as protocol facts.
+
+The flash image is 128 KiB of zeros with deterministic `EMUK` + 12-byte blocks at `0x1A020`, `0x1A070` and `0x1B020`, plus settings/calibration markers. `auto_exploit --action dump` reports these as **unvalidated key candidates** — the `EMUK` prefix is the proof they are synthetic. A candidate is not a link key: `--action full` says that replay validation is required and that the impersonation stage is not implemented. Use `--read-only` to reject flash and RAM writes with `READ_ONLY`.
 
 ### Explorer commands
 
@@ -823,7 +831,20 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`client_factory` is a transport-level seam: any object implementing the bleak methods used by `BLETransport` works. `fingerprint()` and `auto_exploit()` accept the same keyword, which is how `race.py emulate --action {fingerprint,dump,full}` exercises the real module code without hardware.
+`client_factory` is a transport-level seam: any object implementing the bleak methods used by `BLETransport` works. `fingerprint()` and `auto_exploit()` accept the same keyword, which is how `race.py emulate --action {fingerprint,dump,full}` exercises the real module code without hardware. Discovery has a parallel seam:
+
+```python
+from emulator import VirtualHeadphone, VirtualScanner
+from modules.discovery import scan_for_targets
+
+device = VirtualHeadphone("sony-wh1000xm5")
+results = await scan_for_targets(
+    RACEConfig(),
+    deep_scan=True,
+    scanner=VirtualScanner.from_headphones([device]),
+    client_factory=lambda _address: device.client(),
+)
+```
 
 ### Tests
 
@@ -831,7 +852,7 @@ asyncio.run(main())
 python3 -m unittest tests.test_emulator -v
 ```
 
-The 51 emulator tests cover frame encoding, every synthetic response, fault selection and effects, service/characteristic failure modes, `BLETransport` integration, `fingerprint()`/`auto_exploit()`, the explorer and the CLI. They use only the standard library — no radio, no `bleak`, no pytest plugin required — and the repository's `pytest` configuration collects them alongside `tests/test_packet.py`.
+The emulator suite covers frame encoding, every synthetic response, fault selection and effects, service/characteristic failure modes, ATT fragmentation/reassembly, opcode correlation, `BLETransport` integration, `fingerprint()`/`auto_exploit()`, discovery via an injected scanner, the explorer and the CLI. It uses only the standard library — no radio, no `bleak` required for the virtual path. `tests/test_packet_fuzz.py` adds fixed-seed parser/assembler fuzzing and round-trip properties.
 
 For the complete offline suite, including capture safety, CLI options, and transport lifecycle regression checks:
 
@@ -842,14 +863,14 @@ ruff check .
 mypy
 ```
 
-The coverage threshold measures `utils/`, not the whole framework. CI runs the suite on Linux and macOS with Python 3.10 and 3.12; real-device compatibility requires separate hardware testing.
+The coverage threshold measures `utils/` and `emulator/`, not the whole framework. CI runs the suite on Linux and macOS with Python 3.10 and 3.12; real-device compatibility requires separate hardware testing.
 
 ### Limits
 
-- **Discovery is not emulated.** `scan` and `hunt` still require a real adapter because they enumerate advertisers over HCI. The emulator starts at the GATT connection boundary.
+- **Discovery is injectable, not HCI-emulated.** `scan_for_targets()` and `aggressive_scan()` accept `scanner=` and `client_factory=`; `emulator.scanner.VirtualScanner` exercises them offline, and `python3 -m emulator --discover` runs the real `scan_for_targets()` against that virtual advertiser. The `race.py scan`/`hunt` commands still default to real HCI because they have no CLI flag for a virtual adapter.
 - **One central at a time.** A second `VirtualBleakClient.connect()` raises while the first is attached, mirroring a headset that already has a phone.
 - **No pairing, bonding or Classic transport.** Those are outside the RACE application protocol.
-- **No ATT fragmentation.** A flash-page reply is delivered as one notification regardless of MTU; a real device fragments at the negotiated ATT MTU, and the client currently assumes a single write.
+- **ATT fragmentation is modelled, not negotiated.** Pass `--mtu` (or `att_mtu=`) to fragment notifications and large GATT writes at `MTU - 3`; `BLETransport` reassembles inbound fragments and detects truncated replies, while the virtual client/device model outbound long-write reassembly. A real stack still owns actual ATT/L2CAP negotiation and retransmission.
 - **Timing is event-loop scheduling.** `slow` demonstrates timeout handling; it is not an RF timing model.
 - **Not a hardware substitute.** Synthetic replies prove client logic and protocol handling, not firmware behaviour. Validate conclusions on owned hardware, under authorization.
 

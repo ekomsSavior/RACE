@@ -98,6 +98,20 @@ def test_emulate_captures_virtual_traffic(tmp_path, monkeypatch):
     assert _att_fields(rx_record[3])["value"].startswith(bytes.fromhex("05 01"))
 
 
+def test_emulate_forwards_mtu_and_discover(monkeypatch):
+    seen = {}
+
+    async def fake_run(**kwargs):
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(race, "run_emulator", fake_run)
+    result = CliRunner().invoke(race.cli, ["emulate", "--mtu", "23", "--discover"])
+    assert result.exit_code == 0, result.output
+    assert seen["att_mtu"] == 23
+    assert seen["discover"] is True
+
+
 def test_scan_reports_that_capture_does_not_apply(tmp_path, monkeypatch, caplog):
     path = tmp_path / "scan.pcap"
 

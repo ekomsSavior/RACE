@@ -106,7 +106,7 @@ def test_closed_transport_rejects_reentry_without_opening_client():
 def test_hunt_timeout_reaches_scanner_without_radio(monkeypatch):
     seen = []
 
-    async def fake_scan(config, timeout):
+    async def fake_scan(config, timeout, **_kwargs):
         seen.append((config.scan_timeout_s, timeout))
         return []
 

@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import os
 import struct
+import tempfile
 import unittest
 
 from emulator import (
@@ -21,10 +23,12 @@ from emulator import (
     FaultRule,
     FaultSpecError,
     VirtualHeadphone,
+    VirtualScanner,
     VirtualSession,
     load_profile,
     parse_fault_spec,
 )
+from emulator.cli import main
 from emulator.cli import run as run_emulator
 from emulator.device import PROFILES, profile_names
 from emulator.responses import KEY_MARKER
@@ -34,7 +38,9 @@ from emulator.status import (
     STATUS_OUT_OF_RANGE,
     STATUS_UNSUPPORTED,
 )
-from modules.exploit import auto_exploit
+from modules.auto_hunter import hunt_and_pwn
+from modules.discovery import aggressive_scan, scan_for_targets
+from modules.exploit import auto_exploit, find_key_candidates, struct_pack_flash
 from modules.fingerprint import fingerprint
 from transports.ble import BLETransport, BLETransportError
 from utils.config import RACEConfig
@@ -61,6 +67,27 @@ def make_transport(device: VirtualHeadphone, *, read_timeout: float = 0.2) -> BL
         config=fast_config(read_timeout),
         client_factory=lambda _address: device.client(),
     )
+
+
+class ExploitHeuristicTests(unittest.TestCase):
+    def test_candidate_scan_includes_last_full_stride(self) -> None:
+        data = b"\x01" * 16 + b"\x00" * 224 + b"\x01" * 16
+        candidates = find_key_candidates(data, 0x1A000)
+        self.assertEqual([c["offset"] for c in candidates], [0x1A000, 0x1A0F0])
+
+    def test_candidates_are_never_marked_validated(self) -> None:
+        candidates = find_key_candidates(b"\xff" * 32, 0)
+        self.assertTrue(candidates)
+        self.assertTrue(all(c["validated"] is False for c in candidates))
+
+    def test_flash_payload_is_seven_bytes_and_checks_range(self) -> None:
+        payload = struct_pack_flash(0x1A000)
+        self.assertEqual(payload, struct.pack("<BHI", 0, 1, 0x1A000))
+        self.assertEqual(len(payload), 7)
+        with self.assertRaises(ValueError):
+            struct_pack_flash(-1)
+        with self.assertRaises(ValueError):
+            struct_pack_flash(0x1_0000_0000)
 
 
 class ProtocolEncodingTests(unittest.TestCase):
@@ -332,8 +359,148 @@ class TransportIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["build"], device.build)
         self.assertEqual(result["bd_addr"], device.bd_addr)
-        self.assertIn("Potential Link Key", buffer.getvalue())
+        self.assertTrue(result["key_candidates"])
+        self.assertFalse(result["key_candidates"][0]["validated"])
+        self.assertIn("Key candidate (unvalidated)", buffer.getvalue())
         self.assertIn(KEY_MARKER.hex(), buffer.getvalue().lower())
+
+    async def test_auto_exploit_flash_failure_is_an_error(self) -> None:
+        device = VirtualHeadphone(
+            "bose-qc-earbuds-3",
+            errors=[FaultRule(cmd=CMD_READ_FLASH, kind=FaultKind.SILENT)],
+        )
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            result = await auto_exploit(
+                device.address,
+                "dump",
+                fast_config(0.03),
+                client_factory=lambda _address: device.client(),
+            )
+        self.assertEqual(result["status"], "error")
+        self.assertIn("flash read failed at every offset", result["message"])
+        self.assertEqual(result["flash"]["status"], "error")
+        self.assertEqual(len(result["flash"]["errors"]), 4)
+        self.assertNotIn("Key candidate", buffer.getvalue())
+
+    async def test_auto_exploit_full_never_claims_impersonation(self) -> None:
+        device = VirtualHeadphone("bose-qc-earbuds-3")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            result = await auto_exploit(
+                device.address,
+                "full",
+                fast_config(),
+                client_factory=lambda _address: device.client(),
+            )
+        output = buffer.getvalue()
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["impersonation"], "not_attempted")
+        self.assertIn("Candidate key material found", output)
+        self.assertIn("replay validation is required", output)
+        self.assertIn("not implemented", output)
+        self.assertNotIn("can be impersonated", output)
+
+    async def test_full_with_silent_flash_skips_impersonation(self) -> None:
+        device = VirtualHeadphone(
+            errors=[FaultRule(cmd=CMD_READ_FLASH, kind=FaultKind.SILENT)]
+        )
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            result = await auto_exploit(
+                device.address,
+                "full",
+                fast_config(0.03),
+                client_factory=lambda _address: device.client(),
+            )
+        output = buffer.getvalue()
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Impersonation stage skipped", output)
+        self.assertNotIn("Candidate key material", output)
+        self.assertNotIn("can be impersonated", output)
+
+    async def test_stale_duplicate_is_discarded_by_opcode_correlation(self) -> None:
+        device = VirtualHeadphone(
+            errors=[FaultRule(cmd=CMD_GET_BD_ADDR, kind=FaultKind.DUPLICATE)]
+        )
+        async with make_transport(device) as transport:
+            first = await transport.send_command(CMD_GET_BD_ADDR)
+            second = await transport.send_command(CMD_GET_BUILD)
+        self.assertEqual(first, device.bd_addr_bytes)
+        self.assertEqual(second, device.build.encode("utf-8") + b"\x00")
+
+    async def test_unsolicited_frame_is_ignored(self) -> None:
+        device = VirtualHeadphone("generic-airoha")
+        async with make_transport(device) as transport:
+            # Inject a reply for a different command before issuing the read.
+            transport._response_queue.put_nowait(  # noqa: SLF001 - deliberate test seam
+                bytes.fromhex("05 01 08 00 05 0C A0 12 34 56 78 90")
+            )
+            payload = await transport.send_command(CMD_GET_BUILD)
+        self.assertEqual(payload, device.build.encode("utf-8") + b"\x00")
+
+    async def test_only_mismatched_frames_raise_no_response(self) -> None:
+        device = VirtualHeadphone("generic-airoha", answer_unknown=False)
+        transport = make_transport(device, read_timeout=0.05)
+        await transport.connect()
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_soon(
+                transport._response_queue.put_nowait,  # noqa: SLF001 - test seam
+                bytes.fromhex("05 01 08 00 05 0C A0 12 34 56 78 90"),
+            )
+            with self.assertRaises(BLETransportError) as ctx:
+                await transport.send_command(0x7777)
+        finally:
+            await transport.disconnect()
+        self.assertEqual(ctx.exception.code, "NO_RESPONSE")
+
+    async def test_late_same_opcode_reply_is_drained_before_next_write(self) -> None:
+        device = VirtualHeadphone(
+            errors=[
+                FaultRule(
+                    cmd=CMD_GET_BUILD,
+                    kind=FaultKind.SLOW,
+                    delay_s=0.15,
+                    times=1,
+                )
+            ]
+        )
+        transport = make_transport(device, read_timeout=0.05)
+        await transport.connect()
+        try:
+            with self.assertRaises(BLETransportError):
+                await transport.send_command(CMD_GET_BUILD)
+            await asyncio.sleep(0.25)  # late reply is now queued
+            device.responder.build = "SECOND BUILD"
+            payload = await transport.send_command(CMD_GET_BUILD)
+        finally:
+            await transport.disconnect()
+        self.assertEqual(payload, b"SECOND BUILD\x00")
+
+    async def test_att_fragmentation_is_reassembled_by_transport(self) -> None:
+        device = VirtualHeadphone("generic-airoha", att_mtu=23)
+        self.assertEqual(device.notification_size, 20)
+        async with make_transport(device) as transport:
+            payload = await transport.send_command(
+                CMD_READ_FLASH, struct.pack("<BHI", 0, 1, 0x1A000)
+            )
+        self.assertGreater(len(payload), 256)
+        self.assertEqual(payload[6 + 0x20 : 6 + 0x24], KEY_MARKER)
+
+    async def test_session_reassembles_fragments_and_can_keep_raw(self) -> None:
+        device = VirtualHeadphone("generic-airoha", att_mtu=23)
+        async with VirtualSession(device, read_timeout=0.2) as session:
+            joined = await session.send_command(CMD_GET_BUILD)
+        self.assertEqual(len(joined), 1)
+        self.assertEqual(parse_race_response(joined[0]).cmd, CMD_GET_BUILD)
+
+        async with VirtualSession(
+            device, read_timeout=0.2, reassemble=False
+        ) as raw_session:
+            chunks = await raw_session.send_command(CMD_GET_BUILD)
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(b"".join(chunks), joined[0])
 
     async def test_missing_service(self) -> None:
         device = VirtualHeadphone("generic-airoha", expose_service=False)
@@ -435,6 +602,83 @@ class ProfileTests(unittest.TestCase):
             self.assertTrue(PROFILES[key].build.startswith("EMU "))
 
 
+class DiscoveryInjectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scan_for_targets_with_virtual_scanner(self) -> None:
+        device = VirtualHeadphone("sony-wh1000xm5")
+        scanner = VirtualScanner.from_headphones([device])
+        results = await scan_for_targets(
+            fast_config(),
+            deep_scan=True,
+            scanner=scanner,
+            client_factory=lambda _address: device.client(),
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["address"], device.address)
+        self.assertTrue(results[0]["vulnerable"])
+        self.assertTrue(results[0]["race_service"])
+        self.assertTrue(results[0]["race_tx"])
+
+    async def test_aggressive_scan_with_virtual_scanner(self) -> None:
+        device = VirtualHeadphone("generic-airoha")
+        scanner = VirtualScanner.from_headphones([device])
+        results = await aggressive_scan(
+            fast_config(),
+            timeout=1,
+            scanner=scanner,
+            client_factory=lambda _address: device.client(),
+        )
+        self.assertEqual(
+            results, [{"address": device.address, "name": device.name, "rssi": device.rssi}]
+        )
+
+    async def test_hunt_and_pwn_offline_reports_assessment_not_ownership(self) -> None:
+        device = VirtualHeadphone("generic-airoha")
+        scanner = VirtualScanner.from_headphones([device])
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            await hunt_and_pwn(
+                fast_config(),
+                timeout=1,
+                scanner=scanner,
+                client_factory=lambda _address: device.client(),
+            )
+        output = buffer.getvalue()
+        self.assertIn("flash read succeeded", output)
+        self.assertIn("unvalidated key candidate(s)", output)
+        self.assertNotIn("OWNED", output)
+
+    async def test_virtual_scanner_exposes_both_discovery_shapes(self) -> None:
+        device = VirtualHeadphone("generic-airoha")
+        scanner = VirtualScanner.from_headphones([device])
+        plain = await scanner.discover()
+        advertised = await scanner.discover(return_adv=True)
+        self.assertEqual(plain[0].address, device.address)
+        advertised_device, adv = advertised[device.address]
+        self.assertEqual(advertised_device.name, device.name)
+        self.assertEqual(adv.rssi, device.rssi)
+
+
+class AttMtuTests(unittest.IsolatedAsyncioTestCase):
+    def test_invalid_mtu_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            VirtualHeadphone(att_mtu=3)
+
+    async def test_report_records_mtu(self) -> None:
+        device = VirtualHeadphone(att_mtu=185)
+        self.assertEqual(device.report()["att_mtu"], 185)
+        self.assertEqual(device.report()["notification_size"], 182)
+
+    async def test_large_write_is_chunked_and_reassembled(self) -> None:
+        device = VirtualHeadphone("generic-airoha", att_mtu=23)
+        data = b"\xAB" * 40
+        payload = struct.pack("<BHI", 0, 1, 0x1A100) + data
+        async with make_transport(device) as transport:
+            response = await transport.send_command(CMD_WRITE_FLASH, payload)
+        self.assertEqual(struct.unpack_from("<H", response, 0)[0], STATUS_OK)
+        self.assertEqual(device.stats.requests, 1)
+        self.assertEqual(bytes(device.flash[0x1A100 : 0x1A128]), data)
+
+
 class SessionExplorerTests(unittest.IsolatedAsyncioTestCase):
     async def test_raw_frames_and_decode(self) -> None:
         device = VirtualHeadphone("generic-airoha")
@@ -503,6 +747,103 @@ class SessionExplorerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             await run_emulator(error_specs=["bogus"], out=lines.append), 2
         )
+
+    async def test_explorer_command_surface(self) -> None:
+        lines: list[str] = []
+        commands = [
+            "help",
+            "build",
+            "bdaddr",
+            "flash",
+            "flash bad",
+            "flash 0x1A000 1",
+            "write-flash",
+            "write-flash bad DEADBEEF",
+            "write-flash 0x1A100 DEADBEEF",
+            "ram",
+            "ram bad",
+            "ram 0x10 8",
+            "write-ram",
+            "write-ram 0x10 0102",
+            "fota 0102",
+            "cmd",
+            "cmd nonsense",
+            "cmd 0x1E08",
+            "send",
+            "send 050",
+            "send 05000200081E",
+            "fault",
+            "fault bogus",
+            "fault build:silent",
+            "faults",
+            "clear-faults",
+            "dump",
+            "dump 0x40000",
+            "dump 0x1A000 32",
+            "scan",
+            "profiles",
+            "state",
+            "reset",
+            "bogus",
+            "quit",
+        ]
+        code = await run_emulator(commands=commands, out=lines.append)
+        self.assertEqual(code, 0)
+        text = "\n".join(lines)
+        self.assertIn("Commands", text)
+        self.assertIn("unknown command", text)
+        self.assertIn("virtual advertisement", text)
+        self.assertIn("built-in profiles", text)
+        self.assertIn("virtual headphone state", text)
+        self.assertIn("outside the flash image", text)
+
+    def test_cli_main_entry_points(self) -> None:
+        self.assertEqual(main(["--list-profiles"]), 0)
+        self.assertEqual(main(["--mtu", "3", "--command", "build"]), 2)
+        self.assertEqual(main(["--error", "bogus"]), 2)
+        self.assertEqual(main(["--script", "/does/not/exist"]), 2)
+        self.assertEqual(main(["--command", "build", "--json"]), 0)
+        self.assertEqual(main(["--action", "fingerprint"]), 0)
+
+    async def test_cli_script_file_and_mtu(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as handle:
+            handle.write("build\nbdaddr\n")
+            path = handle.name
+        try:
+            lines: list[str] = []
+            code = await run_emulator(
+                script_path=path,
+                att_mtu=23,
+                out=lines.append,
+            )
+        finally:
+            os.unlink(path)
+        self.assertEqual(code, 0)
+        text = "\n".join(lines)
+        self.assertIn("ATT MTU      23", text)
+        self.assertIn("REQ", text)
+
+    async def test_cli_action_failure_returns_nonzero(self) -> None:
+        lines: list[str] = []
+        code = await run_emulator(
+            action="dump",
+            error_specs=["flash_read:silent"],
+            read_timeout=0.03,
+            out=lines.append,
+        )
+        self.assertEqual(code, 1)
+        text = "\n".join(lines)
+        self.assertIn("auto_exploit failed", text)
+        self.assertNotIn("can be impersonated", text)
+
+    async def test_cli_discover_uses_virtual_scanner(self) -> None:
+        lines: list[str] = []
+        code = await run_emulator(discover=True, out=lines.append)
+        self.assertEqual(code, 0)
+        text = "\n".join(lines)
+        self.assertIn("scan_for_targets()", text)
+        self.assertIn("RACE service found", text)
+        self.assertIn("discovery found 1 device(s)", text)
 
 
 if __name__ == "__main__":
