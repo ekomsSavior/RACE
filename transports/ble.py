@@ -9,12 +9,16 @@ modules and prevents connection leaks under exceptions/timeouts.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 from bleak import BleakClient
 
+from utils.capture import CaptureError, Direction, WireCapture, open_capture
 from utils.config import RACEConfig
 from utils.packet import RACEProtocolError, build_race_packet, parse_race_response
+
+logger = logging.getLogger("race")
 
 RACE_SERVICE_UUID = "00001200-0000-1000-8000-00805f9b34fb"
 RACE_TX_UUID = "00001201-0000-1000-8000-00805f9b34fb"
@@ -36,6 +40,8 @@ class BLETransport:
         self._rx_char = None
         self._response_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._closed = False
+        # Optional pcap/btsnoop sink; opened on connect, closed on disconnect.
+        self._capture: WireCapture | None = None
 
     async def __aenter__(self) -> BLETransport:
         await self.connect()
@@ -65,6 +71,9 @@ class BLETransport:
 
         if self._rx_char is not None:
             self._client.start_notify(self._rx_char, self._notification_handler)
+
+        if self._capture is None:
+            self._capture = self._open_capture()
 
     async def _ensure_connected(self) -> None:
         if self._closed:
@@ -99,6 +108,7 @@ class BLETransport:
         await self._ensure_connected()
 
         packet = build_race_packet(cmd, payload, head=self.config.head_standard)
+        self._record("tx", packet)
         await self._client.write_gatt_char(self._tx_char, packet, response=True)
 
         try:
@@ -107,6 +117,10 @@ class BLETransport:
             )
         except asyncio.TimeoutError:
             raise BLETransportError("No RACE response within timeout", code="NO_RESPONSE") from None
+
+        # Capture before validation so malformed/failing replies are on disk
+        # even when BAD_RESPONSE is what ends the session.
+        self._record("rx", raw)
 
         try:
             return parse_race_response(raw).payload
@@ -119,11 +133,45 @@ class BLETransport:
         if self._closed:
             return
         self._closed = True
-        if self._client is not None:
-            try:
-                if self._client.is_connected:
-                    await self._client.disconnect()
-            finally:
-                self._client = None
-                self._tx_char = None
-                self._rx_char = None
+        try:
+            if self._client is not None and self._client.is_connected:
+                await self._client.disconnect()
+        finally:
+            self._client = None
+            self._tx_char = None
+            self._rx_char = None
+            self._close_capture()
+
+    # -- wire capture ------------------------------------------------------
+
+    def _open_capture(self) -> WireCapture | None:
+        """Open the configured capture sink, never failing the session."""
+        try:
+            capture = open_capture(self.config.capture_path, self.config.capture_format)
+        except (CaptureError, OSError) as exc:
+            logger.warning("Wire capture disabled: %s", exc)
+            return None
+        if capture is not None:
+            logger.info("Wire capture -> %s [%s]", capture.path, capture.format.value)
+        return capture
+
+    def _record(self, direction: Direction, frame: Any) -> None:
+        """Dump one frame to the capture sink; never raises into the call path."""
+        if self._capture is None:
+            return
+        try:
+            self._capture.record(direction, frame)
+        except (CaptureError, TypeError) as exc:
+            logger.warning("Wire capture write failed: %s", exc)
+
+    def _close_capture(self) -> None:
+        capture, self._capture = self._capture, None
+        if capture is None:
+            return
+        capture.close()
+        logger.info(
+            "Wire capture saved: %s (%d frames, %d bytes)",
+            capture.path,
+            capture.frames,
+            capture.bytes,
+        )

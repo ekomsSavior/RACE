@@ -133,6 +133,7 @@ flowchart TB
     classDef proto fill:#1d1430,stroke:#9d4edd,color:#ecd9ff,stroke-width:1.5px
     classDef link fill:#14181f,stroke:#7d8590,color:#e6edf3,stroke-width:1.5px
     classDef device fill:#0f241c,stroke:#43aa8b,color:#d8f3e8,stroke-width:2px
+    classDef capture fill:#1a1a1f,stroke:#6e7681,color:#c9d1d9,stroke-width:1.5px,stroke-dasharray:4 2
 ```
 
 **Colour legend** — held constant across every diagram in this document:
@@ -335,9 +336,11 @@ One `send_command()` call, end to end — encode, write, notify, drain, validate
 flowchart LR
     A["cmd: int<br/>payload: bytes"]:::proto --> B["build_race_packet()<br/>head 0x05 · type 0x00<br/>length = 2 + N"]:::proto
     B --> C["write_gatt_char(TX 0x1201,<br/>response=True)"]:::transport
+    B -.->|capture TX| B2["capture TX<br/>pcap / btsnoop"]:::capture
     C --> D["Airoha SoC"]:::device
     D --> E["notification on RX 0x1202"]:::link
     E --> F["asyncio.Queue<br/>response drain"]:::transport
+    F -.->|capture RX, pre-parse| F2["capture RX<br/>raw or malformed"]:::capture
     F --> G["parse_race_response()<br/>head · type · length · cmd"]:::proto
     G --> H{"fields valid?"}:::proto
     H -->|"yes"| I["RacePacket.payload"]:::ok
@@ -349,6 +352,7 @@ flowchart LR
     classDef transport fill:#0f2430,stroke:#48cae4,color:#d6f4ff,stroke-width:1.5px
     classDef link fill:#14181f,stroke:#7d8590,color:#e6edf3,stroke-width:1.5px
     classDef device fill:#0f241c,stroke:#43aa8b,color:#d8f3e8,stroke-width:2px
+    classDef capture fill:#1a1a1f,stroke:#6e7681,color:#c9d1d9,stroke-width:1.5px,stroke-dasharray:4 2
     classDef ok fill:#0f241c,stroke:#2ea043,color:#d8f3e8,stroke-width:1.5px
     classDef err fill:#2b0f14,stroke:#e63946,color:#ffd7dc,stroke-width:1.5px
 ```
@@ -357,6 +361,35 @@ Two properties shape how you drive it:
 
 - **Request/response pairing is sequential by construction.** `send_command` writes, then `await`s one item from the queue under `read_timeout_s`. There is no per-opcode correlation, so callers must keep commands serial per transport — fire two concurrently and both will consume from the same queue.
 - **Payload, not frame.** Callers never see head, type, or length bytes — the parser strips them and hands back `payload` only. That is why `auto_exploit` can slice `raw[:6]` for the BD_ADDR without arithmetic.
+
+### Wire capture — replay the session in Wireshark
+
+Every frame the transport writes, and every frame it hands to `parse_race_response()`, can be mirrored into a capture file. One flag turns it on for any GATT session; the env var does it without editing the command line:
+
+```bash
+# group option — place it before the subcommand
+sudo python3 race.py --capture /tmp/session.pcap exploit A0:12:34:56:78:90 --action dump
+
+# or set it once for every invocation, including unattended runs
+RACE_CAPTURE=/tmp/session.btsnoop sudo -E python3 race.py huntandpwn --timeout 30
+```
+
+| Path / flag | Container | Open with |
+|:------------|:----------|:----------|
+| `.pcap`, `.cap`, anything else | libpcap, `LINKTYPE_BLUETOOTH_HCI_H4_WITH_PHDR` (201) | Wireshark, `tshark`, `tcpdump -r` |
+| `.btsnoop`, `.snoop` | btsnoop v1, datalink 1002 (H4 UART) | Wireshark, `btmon -r` |
+
+`--capture-format {pcap,btsnoop}` (or `RACE_CAPTURE_FORMAT`) overrides the extension. Each RACE frame is wrapped in a synthetic **HCI ACL → L2CAP (CID `0x0004`) → ATT PDU** chain — requests as ATT Write Commands on handle `0x0023`, responses as ATT Handle Value Notifications on `0x0026` — with the RACE bytes untouched as the attribute value. Direction rides in the pcap pseudo-header and the btsnoop flags, so both readers label host → device and device → host correctly.
+
+```bash
+# just the RACE frames, as hex + opcode, no GUI
+tshark -r /tmp/session.pcap -Y btatt -T fields -e btatt.opcode -e btatt.value
+
+# text replay through BlueZ instead of Wireshark
+btmon -r /tmp/session.btsnoop
+```
+
+Records are flushed per frame, so a killed or crashed session still leaves a loadable file. A capture that cannot be opened or written (bad path, full disk) logs a warning and never interrupts the radio session. Only sessions that speak the protocol produce frames — `scan` and `hunt` stop at discovery and never reach the parser.
 
 ---
 
@@ -453,6 +486,8 @@ chmod +x race.py
 | `click` | Command group, options, `--action` choice validation | CLI won't import |
 | `colorama` | Banner + inline ANSI, cross-terminal | plain, uncoloured output |
 
+Wire capture ([§06](#06--command-data-path)) needs no extra dependency — pcap and btsnoop are written with `struct` from the standard library, so there is no libpcap binding to install.
+
 ---
 
 ## 10 · CLI reference
@@ -464,6 +499,8 @@ chmod +x race.py
 | `exploit <target>` | `--action {fingerprint,dump,full}` | `auto_exploit()` | read 5 s |
 | `info <target>` | — | `fingerprint()` | read 5 s |
 | `huntandpwn` | `--timeout` | `hunt_and_pwn()` | 20 s |
+
+Group-level flags (valid on every command, before the subcommand): `--capture PATH` / `RACE_CAPTURE`, `--capture-format {pcap,btsnoop}` / `RACE_CAPTURE_FORMAT`. See [§06](#06--command-data-path).
 
 ```bash
 # passive enumerate, then verify services on name-matched peers
@@ -483,6 +520,9 @@ sudo python3 race.py exploit A0:12:34:56:78:90 --action full
 
 # discovery → exploitation, unattended
 sudo python3 race.py huntandpwn --timeout 30
+
+# same run, with the wire traffic saved for triage
+sudo python3 race.py --capture /tmp/session.pcap huntandpwn --timeout 30
 ```
 
 `--action` and the subcommand set are validated by `click.Choice`, so a typo fails before any radio traffic is generated.
@@ -504,6 +544,7 @@ Honest matrix — what exists, what is a constant, and what is not written yet:
 | Flash write (`0x0404`) | `utils/packet.py` | ![part](https://img.shields.io/badge/opcode_only-d29922?style=flat-square) |
 | RAM read/write (`0x1680`/`0x1681`) | `utils/packet.py` | ![part](https://img.shields.io/badge/opcode_only-d29922?style=flat-square) |
 | FOTA path (head `0x15`) | `utils/config.py` | ![part](https://img.shields.io/badge/constants_only-d29922?style=flat-square) |
+| Wire capture for Wireshark/btmon | `utils/capture.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
 | Classic RFCOMM transport | `transports/` | ![todo](https://img.shields.io/badge/planned-6e7681?style=flat-square) |
 | Link-key validation + replay | `modules/exploit.py` | ![todo](https://img.shields.io/badge/stub-6e7681?style=flat-square) |
 | HFP pivot (calls, contacts) | — | ![todo](https://img.shields.io/badge/out_of_scope-6e7681?style=flat-square) |
@@ -533,6 +574,7 @@ RACE/
 │   ├── __init__.py
 │   └── ble.py               # GATT client, notify drain, request/response
 └── utils/
+    ├── capture.py           # pcap/btsnoop wire capture (Wireshark, btmon)
     ├── config.py            # RACEConfig: UUIDs, heads, timeouts
     └── packet.py            # frame encode/decode, opcodes, error codes
 ```
@@ -552,6 +594,7 @@ RACE/
 | Connection stalls | BlueZ D-Bus contention with a phone already paired to the target | Disconnect the paired host, or retry after the advertising window reopens |
 | `Operation not permitted` | Adapter needs raw HCI access | Run with `sudo`, or grant `CAP_NET_RAW` + `CAP_NET_ADMIN` |
 | Scan returns nothing | No discoverable advertisers in range | Increase `--timeout`; BLE advertisers rotate addresses — rescan |
+| Capture file is empty | Session never spoke RACE, or the file was opened by a command without a transport | Use `--capture` with `exploit`/`info`/`huntandpwn`; `scan`/`hunt` only enumerate |
 
 **Operational notes.** Passive scanning leaves no trace on the target. Every `connect`, `--deep`, and `hunt` step does: it opens an ATT carrier and is visible in the device's connection log. Budget a scan window before staging; a headset that is actively streaming to a phone typically will not accept a second central.
 

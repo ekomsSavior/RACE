@@ -41,6 +41,11 @@ class RACEConfig:
     connect_timeout_s: float = 10.0
     read_timeout_s: float = 5.0
     scan_timeout_s: float = 10.0
+    # Optional wire capture: path is ``None`` until a session asks for one
+    # (``--capture`` or ``RACE_CAPTURE``); format is inferred from the
+    # extension when ``None``.  See :mod:`utils.capture`.
+    capture_path: str | None = None
+    capture_format: str | None = None
 
     def frame_header(self, head: int, ptype: int, payload_len: int) -> bytes:
         return struct.pack(FRAME_HEADER_FMT, head, ptype, payload_len)

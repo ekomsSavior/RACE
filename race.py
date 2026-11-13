@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass, replace
 from typing import Any
 
 import click
@@ -43,11 +44,25 @@ BANNER = f"""\
 """
 
 
-def _build_config(timeout: int | None, deep: bool) -> RACEConfig:
-    cfg = RACEConfig.cli_defaults()
+@dataclass(frozen=True)
+class CLIOptions:
+    """Group-level options forwarded to every subcommand."""
+
+    capture_path: str | None = None
+    capture_format: str | None = None
+
+
+def _build_config(ctx: click.Context, *, timeout: int | None = None) -> RACEConfig:
+    """Merge group options (wire capture, timeout) over the defaults."""
+    options = ctx.obj if isinstance(ctx.obj, CLIOptions) else CLIOptions()
+    overrides: dict[str, Any] = {}
     if timeout is not None:
-        cfg.scan_timeout_s = float(timeout)
-    return cfg
+        overrides["scan_timeout_s"] = float(timeout)
+    if options.capture_path is not None:
+        overrides["capture_path"] = options.capture_path
+    if options.capture_format is not None:
+        overrides["capture_format"] = options.capture_format
+    return replace(RACEConfig.cli_defaults(), **overrides)
 
 
 def _console_result(status: str, result: dict[str, Any]) -> None:
@@ -62,8 +77,26 @@ def _console_result(status: str, result: dict[str, Any]) -> None:
 
 
 @click.group()
-def cli() -> None:
+@click.option(
+    "--capture",
+    "capture_path",
+    metavar="PATH",
+    default=None,
+    envvar="RACE_CAPTURE",
+    help="Dump raw RACE frames to PATH (.pcap for Wireshark, .btsnoop for btmon).",
+)
+@click.option(
+    "--capture-format",
+    "capture_format",
+    type=click.Choice(["pcap", "btsnoop"]),
+    default=None,
+    envvar="RACE_CAPTURE_FORMAT",
+    help="Capture container format; inferred from the PATH extension when omitted.",
+)
+@click.pass_context
+def cli(ctx: click.Context, capture_path: str | None, capture_format: str | None) -> None:
     """RACE Framework - Institutional Edition."""
+    ctx.obj = CLIOptions(capture_path, capture_format)
     print(BANNER)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -80,9 +113,10 @@ def cli() -> None:
     is_flag=True,
     help="Perform deep service discovery.",
 )
-def scan(timeout: int, deep: bool) -> None:
+@click.pass_context
+def scan(ctx: click.Context, timeout: int, deep: bool) -> None:
     """Discover vulnerable Bluetooth headphones."""
-    config = _build_config(timeout, deep)
+    config = _build_config(ctx, timeout=timeout)
     results = asyncio.run(scan_for_targets(config, deep))
     if not results:
         logger.info("No devices found")
@@ -108,9 +142,10 @@ def scan(timeout: int, deep: bool) -> None:
     type=int,
     help="Scan duration in seconds.",
 )
-def hunt(timeout: int) -> None:
+@click.pass_context
+def hunt(ctx: click.Context, timeout: int) -> None:
     """Aggressively hunt for RACE services."""
-    config = _build_config(timeout, False)
+    config = _build_config(ctx, timeout=timeout)
     results = asyncio.run(aggressive_scan(config, timeout))
     if not results:
         logger.info("No RACE devices found")
@@ -128,18 +163,20 @@ def hunt(timeout: int) -> None:
     type=click.Choice(["fingerprint", "dump", "full"]),
     help="Exploit action to perform.",
 )
-def exploit(target_address: str, action: str) -> None:
+@click.pass_context
+def exploit(ctx: click.Context, target_address: str, action: str) -> None:
     """Auto-exploit a RACE device."""
-    config = RACEConfig.cli_defaults()
+    config = _build_config(ctx)
     result = asyncio.run(auto_exploit(target_address, action, config))
     _console_result(result["status"], result)
 
 
 @cli.command()
 @click.argument("target_address")
-def info(target_address: str) -> None:
+@click.pass_context
+def info(ctx: click.Context, target_address: str) -> None:
     """Get build info from target."""
-    config = RACEConfig.cli_defaults()
+    config = _build_config(ctx)
     result = asyncio.run(fingerprint(target_address, config))
     if result["status"] == "success":
         logger.info("Device Fingerprint")
@@ -155,10 +192,10 @@ def info(target_address: str) -> None:
     type=int,
     help="Scan duration in seconds.",
 )
-def huntandpwn(timeout: int) -> None:
+@click.pass_context
+def huntandpwn(ctx: click.Context, timeout: int) -> None:
     """Auto-hunt and exploit all RACE devices."""
-    config = RACEConfig.cli_defaults()
-    config.scan_timeout_s = float(timeout)
+    config = _build_config(ctx, timeout=timeout)
     asyncio.run(hunt_and_pwn(config))
 
 
