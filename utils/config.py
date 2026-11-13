@@ -24,7 +24,7 @@ FRAME_HEAD_FOTA = 0x15
 FRAME_TYPE_REQUEST = 0x00
 FRAME_TYPE_RESPONSE = 0x01
 FRAME_HEADER_FMT = "<BBH"  # head, type, length
-FRAME_CMD_FMT = "<H"       # little-endian command opcode
+FRAME_CMD_FMT = "<H"  # little-endian command opcode
 
 
 @dataclass(frozen=True)
@@ -49,5 +49,5 @@ class RACEConfig:
         return struct.pack(FRAME_CMD_FMT, opcode)
 
     @classmethod
-    def cli_defaults(cls) -> "RACEConfig":
+    def cli_defaults(cls) -> RACEConfig:
         return cls()

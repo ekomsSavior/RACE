@@ -1,7 +1,6 @@
-import asyncio
 from typing import Any
 
-from bleak import BleakScanner, BleakClient
+from bleak import BleakClient, BleakScanner
 
 from utils.config import RACEConfig
 
@@ -10,8 +9,16 @@ RACE_TX_UUID = "00001201-0000-1000-8000-00805f9b34fb"
 RACE_RX_UUID = "00001202-0000-1000-8000-00805f9b34fb"
 
 VULNERABLE_MODELS = [
-    "WH-1000XM", "WF-1000XM", "WH-CH", "LinkBuds", "ULT Wear",
-    "Marshall", "JBL", "Bose", "Jabra", "Beyerdynamic"
+    "WH-1000XM",
+    "WF-1000XM",
+    "WH-CH",
+    "LinkBuds",
+    "ULT Wear",
+    "Marshall",
+    "JBL",
+    "Bose",
+    "Jabra",
+    "Beyerdynamic",
 ]
 
 
@@ -30,16 +37,18 @@ async def scan_for_targets(config: RACEConfig, deep_scan: bool = False) -> list[
         name = dev.name if dev.name else "Unknown"
         is_vulnerable = any(model in name for model in VULNERABLE_MODELS)
 
-        found.append({
-            "address": addr,
-            "name": name,
-            "rssi": adv_data.rssi if adv_data else "N/A",
-            "vulnerable": is_vulnerable,
-            "race_service": False,
-        })
+        found.append(
+            {
+                "address": addr,
+                "name": name,
+                "rssi": adv_data.rssi if adv_data else "N/A",
+                "vulnerable": is_vulnerable,
+                "race_service": False,
+            }
+        )
 
     if deep_scan:
-        print(f"[*] Deep scanning for RACE services...")
+        print("[*] Deep scanning for RACE services...")
         for device in found:
             if device["vulnerable"]:
                 print(f"  [*] Checking {device['address']}...")
@@ -53,10 +62,10 @@ async def scan_for_targets(config: RACEConfig, deep_scan: bool = False) -> list[
                                 c.uuid.lower() == config.tx_uuid.lower()
                                 for c in service.characteristics
                             )
-                            print(f"    [+] RACE service found!")
+                            print("    [+] RACE service found!")
                             break
                     await client.disconnect()
-                except Exception as exc:  # noqa: BLEAK
+                except Exception as exc:
                     print(f"    [-] Failed: {str(exc)[:50]}")
     return found
 
@@ -67,7 +76,7 @@ async def aggressive_scan(config: RACEConfig, timeout: int = 15) -> list[dict[st
     print("  RACE HUNTER - Finding vulnerable Bluetooth devices")
     print("=" * 60)
 
-    print(f"[*] Scanning for devices...")
+    print("[*] Scanning for devices...")
     devices = await BleakScanner.discover(timeout=timeout)
 
     race_devices: list[dict[str, Any]] = []
@@ -84,16 +93,18 @@ async def aggressive_scan(config: RACEConfig, timeout: int = 15) -> list[dict[st
 
             for service in client.services:
                 if service.uuid.lower() == config.service_uuid.lower():
-                    race_devices.append({
-                        "address": device.address,
-                        "name": device.name or "Unknown",
-                        "rssi": device.rssi,
-                    })
-                    print(f"\n  [+] RACE device found!")
+                    race_devices.append(
+                        {
+                            "address": device.address,
+                            "name": device.name or "Unknown",
+                            "rssi": device.rssi,
+                        }
+                    )
+                    print("\n  [+] RACE device found!")
                     break
 
             await client.disconnect()
-        except Exception:  # noqa: BLEAK
+        except Exception:
             pass
 
     print("\n")  # Newline after progress

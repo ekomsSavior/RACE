@@ -1,8 +1,5 @@
-from typing import Any
-
 from modules.discovery import aggressive_scan
 from modules.exploit import auto_exploit
-
 from utils.config import RACEConfig
 
 

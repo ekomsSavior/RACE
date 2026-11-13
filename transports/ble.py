@@ -14,7 +14,7 @@ from typing import Any
 from bleak import BleakClient
 
 from utils.config import RACEConfig
-from utils.packet import RACEProtocolError, parse_race_response, build_race_packet
+from utils.packet import RACEProtocolError, build_race_packet, parse_race_response
 
 RACE_SERVICE_UUID = "00001200-0000-1000-8000-00805f9b34fb"
 RACE_TX_UUID = "00001201-0000-1000-8000-00805f9b34fb"
@@ -37,7 +37,7 @@ class BLETransport:
         self._response_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._closed = False
 
-    async def __aenter__(self) -> "BLETransport":
+    async def __aenter__(self) -> BLETransport:
         await self.connect()
         return self
 
@@ -98,9 +98,7 @@ class BLETransport:
         """Send a RACE command and return the validated response payload."""
         await self._ensure_connected()
 
-        packet = build_race_packet(
-            cmd, payload, head=self.config.head_standard
-        )
+        packet = build_race_packet(cmd, payload, head=self.config.head_standard)
         await self._client.write_gatt_char(self._tx_char, packet, response=True)
 
         try:
@@ -108,9 +106,7 @@ class BLETransport:
                 self._response_queue.get(), timeout=self.config.read_timeout_s
             )
         except asyncio.TimeoutError:
-            raise BLETransportError(
-                "No RACE response within timeout", code="NO_RESPONSE"
-            ) from None
+            raise BLETransportError("No RACE response within timeout", code="NO_RESPONSE") from None
 
         try:
             return parse_race_response(raw).payload
