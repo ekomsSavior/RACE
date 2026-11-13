@@ -1,7 +1,9 @@
 import asyncio
+from typing import Any
+
 from bleak import BleakScanner, BleakClient
-from colorama import Fore, Style, init
-init(autoreset=True)
+
+from utils.config import RACEConfig
 
 RACE_SERVICE_UUID = "00001200-0000-1000-8000-00805f9b34fb"
 RACE_TX_UUID = "00001201-0000-1000-8000-00805f9b34fb"
@@ -12,80 +14,87 @@ VULNERABLE_MODELS = [
     "Marshall", "JBL", "Bose", "Jabra", "Beyerdynamic"
 ]
 
-async def scan_for_targets(timeout: int = 10, deep_scan: bool = False):
-    """Scan for RACE-capable devices with service discovery"""
-    print(f"{Fore.CYAN}[*] Scanning for devices ({timeout}s)...{Style.RESET_ALL}")
-    
-    devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
-    
-    found = []
+
+async def scan_for_targets(config: RACEConfig, deep_scan: bool = False) -> list[dict[str, Any]]:
+    """Scan for RACE-capable devices with optional service discovery.
+
+    Returns a list of device dicts (``address``, ``name``, ``rssi``,
+    ``vulnerable``, ``race_service``).
+    """
+    print(f"[*] Scanning for devices ({config.scan_timeout_s:g}s)...")
+
+    devices = await BleakScanner.discover(timeout=config.scan_timeout_s, return_adv=True)
+
+    found: list[dict[str, Any]] = []
     for addr, (dev, adv_data) in devices.items():
         name = dev.name if dev.name else "Unknown"
         is_vulnerable = any(model in name for model in VULNERABLE_MODELS)
-        
+
         found.append({
             "address": addr,
             "name": name,
             "rssi": adv_data.rssi if adv_data else "N/A",
             "vulnerable": is_vulnerable,
-            "race_service": False
+            "race_service": False,
         })
-    
+
     if deep_scan:
-        print(f"{Fore.YELLOW}[*] Deep scanning for RACE services...{Style.RESET_ALL}")
+        print(f"[*] Deep scanning for RACE services...")
         for device in found:
-            if device['vulnerable']:
-                print(f"  {Fore.CYAN}Checking {device['address']}...{Style.RESET_ALL}")
+            if device["vulnerable"]:
+                print(f"  [*] Checking {device['address']}...")
                 try:
-                    client = BleakClient(device['address'])
+                    client = BleakClient(device["address"])
                     await client.connect(timeout=5)
                     for service in client.services:
-                        if service.uuid.lower() == RACE_SERVICE_UUID.lower():
-                            device['race_service'] = True
-                            device['race_tx'] = any(c.uuid.lower() == RACE_TX_UUID.lower() 
-                                                   for c in service.characteristics)
-                            print(f"    {Fore.GREEN}[+] RACE service found!{Style.RESET_ALL}")
+                        if service.uuid.lower() == config.service_uuid.lower():
+                            device["race_service"] = True
+                            device["race_tx"] = any(
+                                c.uuid.lower() == config.tx_uuid.lower()
+                                for c in service.characteristics
+                            )
+                            print(f"    [+] RACE service found!")
                             break
                     await client.disconnect()
-                except Exception as e:
-                    print(f"    {Fore.RED}[-] Failed: {str(e)[:50]}{Style.RESET_ALL}")
-    
+                except Exception as exc:  # noqa: BLEAK
+                    print(f"    [-] Failed: {str(exc)[:50]}")
     return found
 
-async def aggressive_scan(timeout: int = 15):
-    """Find ANY device with RACE service exposed"""
-    print(f"{Fore.RED}{'='*60}{Style.RESET_ALL}")
-    print(f"{Fore.RED}  RACE HUNTER - Finding vulnerable Bluetooth devices{Style.RESET_ALL}")
-    print(f"{Fore.RED}{'='*60}{Style.RESET_ALL}")
-    
-    print(f"{Fore.CYAN}[*] Scanning for devices...{Style.RESET_ALL}")
+
+async def aggressive_scan(config: RACEConfig, timeout: int = 15) -> list[dict[str, Any]]:
+    """Find ANY device with RACE service exposed."""
+    print("=" * 60)
+    print("  RACE HUNTER - Finding vulnerable Bluetooth devices")
+    print("=" * 60)
+
+    print(f"[*] Scanning for devices...")
     devices = await BleakScanner.discover(timeout=timeout)
-    
-    race_devices = []
+
+    race_devices: list[dict[str, Any]] = []
     total = len(devices)
     checked = 0
-    
+
     for device in devices:
         checked += 1
-        print(f"\r  {Fore.YELLOW}[*] Checking {checked}/{total}: {device.address[:8]}...{Style.RESET_ALL}", end="")
-        
+        print(f"\r  [*] Checking {checked}/{total}: {device.address[:8]}...", end="")
+
         try:
             client = BleakClient(device.address)
             await client.connect(timeout=3)
-            
+
             for service in client.services:
-                if service.uuid.lower() == RACE_SERVICE_UUID.lower():
+                if service.uuid.lower() == config.service_uuid.lower():
                     race_devices.append({
                         "address": device.address,
                         "name": device.name or "Unknown",
-                        "rssi": device.rssi
+                        "rssi": device.rssi,
                     })
-                    print(f"\n  {Fore.GREEN}[+] RACE device found!{Style.RESET_ALL}")
+                    print(f"\n  [+] RACE device found!")
                     break
-            
+
             await client.disconnect()
-        except:
+        except Exception:  # noqa: BLEAK
             pass
-    
+
     print("\n")  # Newline after progress
     return race_devices
