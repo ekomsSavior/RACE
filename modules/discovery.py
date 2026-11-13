@@ -77,35 +77,39 @@ async def aggressive_scan(config: RACEConfig, timeout: int = 15) -> list[dict[st
     print("=" * 60)
 
     print("[*] Scanning for devices...")
-    devices = await BleakScanner.discover(timeout=timeout)
+    # return_adv=True is required for RSSI: bleak >= 0.22 removed
+    # BLEDevice.rssi, and reading it raised AttributeError inside the probe
+    # loop below -- which the broad except swallowed, so `hunt` reported
+    # nothing even when a RACE service was found.
+    devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
 
     race_devices: list[dict[str, Any]] = []
     total = len(devices)
     checked = 0
 
-    for device in devices:
+    for address, (device, adv_data) in devices.items():
         checked += 1
-        print(f"\r  [*] Checking {checked}/{total}: {device.address[:8]}...", end="")
+        print(f"\r  [*] Checking {checked}/{total}: {address[:8]}...", end="")
 
         try:
-            client = BleakClient(device.address)
+            client = BleakClient(address)
             await client.connect(timeout=3)
 
             for service in client.services:
                 if service.uuid.lower() == config.service_uuid.lower():
                     race_devices.append(
                         {
-                            "address": device.address,
+                            "address": address,
                             "name": device.name or "Unknown",
-                            "rssi": device.rssi,
+                            "rssi": adv_data.rssi if adv_data else "N/A",
                         }
                     )
                     print("\n  [+] RACE device found!")
                     break
 
             await client.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"\r  [-] {address[:8]} probe failed: {str(exc)[:50]}")
 
     print("\n")  # Newline after progress
     return race_devices

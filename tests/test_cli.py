@@ -1,5 +1,7 @@
 """CLI plumbing tests: group-level capture options reach the session config."""
 
+import logging
+
 import pytest
 from click.testing import CliRunner
 
@@ -94,3 +96,19 @@ def test_emulate_captures_virtual_traffic(tmp_path, monkeypatch):
     tx_record, rx_record = _pcap_records(path)
     assert _att_fields(tx_record[3])["value"] == build_race_packet(CMD_GET_BUILD)
     assert _att_fields(rx_record[3])["value"].startswith(bytes.fromhex("05 01"))
+
+
+def test_scan_reports_that_capture_does_not_apply(tmp_path, monkeypatch, caplog):
+    path = tmp_path / "scan.pcap"
+
+    async def fake_scan(config, deep):
+        return []
+
+    monkeypatch.setattr(race, "scan_for_targets", fake_scan)
+    caplog.set_level(logging.INFO, logger="race")
+
+    result = CliRunner().invoke(race.cli, ["--capture", str(path), "scan"])
+
+    assert result.exit_code == 0, result.output
+    assert any("nothing written" in r.message for r in caplog.records)
+    assert not path.exists()
