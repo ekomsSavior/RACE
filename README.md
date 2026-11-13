@@ -45,7 +45,7 @@ RACE is a modular exploitation framework targeting the Airoha RACE protocol foun
 
 ```bash
 # Clone the repository
-git clone https://github.com/ekomsSavior/RACE.git
+git clone https://github.com/zazieproductions/RACE.git
 cd RACE
 
 # Install system dependencies
@@ -53,7 +53,7 @@ sudo apt update
 sudo apt install -y bluez libbluetooth-dev python3-pip
 
 # Install Python packages
-pip3 install --user bleak asyncio click colorama bumble
+pip3 install --user bleak click colorama
 
 # Make executable
 chmod +x race.py

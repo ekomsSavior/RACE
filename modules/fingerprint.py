@@ -1,16 +1,24 @@
-from transports.ble import BLETransport
-from utils.packet import parse_race_response
+from typing import Any
 
-async def fingerprint(target: str):
-    print(f"[*] Fingerprinting {target}...")
-    transport = BLETransport(target)
+from transports.ble import BLETransport
+from utils.config import RACEConfig
+from utils.packet import CMD_GET_BUILD, parse_race_response
+
+async def fingerprint(target: str, config: RACEConfig | None = None) -> dict[str, Any]:
+    """Fingerprint a RACE device's build info.
+
+    Returns ``{"status": "success", "build": str}`` on success or
+    ``{"status": "error", "message": str}`` on failure.
+    """
+    cfg = config or RACEConfig()
+    result: dict[str, Any] = {"status": "error", "message": "not run"}
+
     try:
-        await transport.connect()
-        raw_response = await transport.send_command(0x1E08)
-        parsed = parse_race_response(raw_response)
-        build_string = parsed['payload'].decode('utf-8', errors='ignore').strip('\x00')
-        return {"status": "success", "build": build_string}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-    finally:
-        await transport.disconnect()
+        async with BLETransport(target, config=cfg) as transport:
+            raw = await transport.send_command(CMD_GET_BUILD)
+            build_string = raw.decode("utf-8", errors="ignore").strip("\x00")
+            result = {"status": "success", "build": build_string}
+    except Exception as exc:  # noqa: BLEAK
+        result = {"status": "error", "message": str(exc)}
+
+    return result

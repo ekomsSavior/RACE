@@ -1,52 +1,133 @@
+"""BLE GATT transport with a deterministic connection lifecycle.
+
+The transport owns its :class:`bleak.BleakClient` and guarantees cleanup
+(via ``async with`` + ``finally``) even when a command fails, which also
+removes the manual ``disconnect()`` calls scattered through the research
+modules and prevents connection leaks under exceptions/timeouts.
+"""
+
+from __future__ import annotations
+
 import asyncio
+from typing import Any
+
 from bleak import BleakClient
+
+from utils.config import RACEConfig
+from utils.packet import RACEProtocolError, parse_race_response, build_race_packet
 
 RACE_SERVICE_UUID = "00001200-0000-1000-8000-00805f9b34fb"
 RACE_TX_UUID = "00001201-0000-1000-8000-00805f9b34fb"
 RACE_RX_UUID = "00001202-0000-1000-8000-00805f9b34fb"
 
+
+class BLETransportError(RACEProtocolError):
+    """Raised when a BLE transport operation fails."""
+
+
 class BLETransport:
-    def __init__(self, address: str):
+    """Facility for sending/receiving RACE commands over BLE GATT."""
+
+    def __init__(self, address: str, *, config: RACEConfig | None = None) -> None:
         self.address = address
-        self.client = None
-        self.tx_char = None
-        self.rx_char = None
-        self.response_queue = asyncio.Queue()
+        self.config = config or RACEConfig()
+        self._client: BleakClient | None = None
+        self._tx_char = None
+        self._rx_char = None
+        self._response_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._closed = False
 
-    async def connect(self):
-        self.client = BleakClient(self.address)
-        await self.client.connect()
-        
-        for service in self.client.services:
-            if service.uuid.lower() == RACE_SERVICE_UUID.lower():
-                for char in service.characteristics:
-                    if char.uuid.lower() == RACE_TX_UUID.lower():
-                        self.tx_char = char
-                    if char.uuid.lower() == RACE_RX_UUID.lower():
-                        self.rx_char = char
-        
-        if not self.tx_char:
-            raise Exception("RACE TX characteristic not found")
-        
-        if self.rx_char:
-            await self.client.start_notify(self.rx_char, self._notification_handler)
-        
-        return True
+    async def __aenter__(self) -> "BLETransport":
+        await self.connect()
+        return self
 
-    def _notification_handler(self, sender, data):
-        self.response_queue.put_nowait(data)
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.disconnect()
 
-    async def send_command(self, cmd: int, payload: bytes = b'') -> bytes:
-        from utils.packet import build_race_packet
-        packet = build_race_packet(cmd, payload)
-        await self.client.write_gatt_char(self.tx_char, packet, response=True)
-        
+    @property
+    def is_connected(self) -> bool:
+        return self._client is not None and self._client.is_connected
+
+    async def connect(self) -> None:
+        """Connect, resolve service/characteristic handles, then start notify."""
+        if self.is_connected:
+            return
+        self._client = BleakClient(self.address)
+        await self._client.connect(timeout=self.config.connect_timeout_s)
+
+        service = self._resolve_service()
+        if service is None:
+            raise BLETransportError("RACE service not found", code="SERVICE_NOT_FOUND")
+        self._tx_char, self._rx_char = self._resolve_characteristics(service)
+
+        if self._tx_char is None:
+            raise BLETransportError("RACE TX characteristic not found", code="TX_NOT_FOUND")
+
+        if self._rx_char is not None:
+            self._client.start_notify(self._rx_char, self._notification_handler)
+
+    async def _ensure_connected(self) -> None:
+        if self._closed:
+            raise BLETransportError("Transport has been closed", code="CLOSED")
+        if not self.is_connected:
+            await self.connect()
+
+    def _resolve_service(self):
+        for service in self._client.services:
+            if service.uuid.lower() == self.config.service_uuid.lower():
+                return service
+        return None
+
+    def _resolve_characteristics(self, service):
+        tx = rx = None
+        for char in service.characteristics:
+            u = char.uuid.lower()
+            if u == self.config.tx_uuid.lower():
+                tx = char
+            elif u == self.config.rx_uuid.lower():
+                rx = char
+        return tx, rx
+
+    def _notification_handler(self, *_args: Any) -> None:
         try:
-            response = await asyncio.wait_for(self.response_queue.get(), timeout=5.0)
-            return response
-        except asyncio.TimeoutError:
-            raise TimeoutError("No RACE response")
+            self._response_queue.put_nowait(self._client.read_gatt_char(self._rx_char))
+        except Exception:
+            self._response_queue.put_nowait(b"")
 
-    async def disconnect(self):
-        if self.client:
-            await self.client.disconnect()
+    async def send_command(self, cmd: int, payload: bytes = b"") -> bytes:
+        """Send a RACE command and return the validated response payload."""
+        await self._ensure_connected()
+
+        packet = build_race_packet(
+            cmd, payload, head=self.config.head_standard
+        )
+        await self._client.write_gatt_char(self._tx_char, packet, response=True)
+
+        try:
+            raw = await asyncio.wait_for(
+                self._response_queue.get(), timeout=self.config.read_timeout_s
+            )
+        except asyncio.TimeoutError:
+            raise BLETransportError(
+                "No RACE response within timeout", code="NO_RESPONSE"
+            ) from None
+
+        try:
+            return parse_race_response(raw).payload
+        except RACEProtocolError as exc:
+            raise BLETransportError(
+                f"Invalid response for cmd 0x{cmd:04X}: {exc}", code="BAD_RESPONSE"
+            ) from exc
+
+    async def disconnect(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._client is not None:
+            try:
+                if self._client.is_connected:
+                    await self._client.disconnect()
+            finally:
+                self._client = None
+                self._tx_char = None
+                self._rx_char = None
