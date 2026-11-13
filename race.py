@@ -15,6 +15,9 @@ from typing import Any
 import click
 from colorama import Fore, Style, init
 
+from emulator.cli import DEFAULT_PROFILE
+from emulator.cli import list_profiles as print_profiles
+from emulator.cli import run as run_emulator
 from modules.auto_hunter import hunt_and_pwn
 from modules.discovery import aggressive_scan, scan_for_targets
 from modules.exploit import auto_exploit
@@ -160,6 +163,86 @@ def huntandpwn(timeout: int) -> None:
     config = RACEConfig.cli_defaults()
     config.scan_timeout_s = float(timeout)
     asyncio.run(hunt_and_pwn(config))
+
+
+@cli.command()
+@click.option(
+    "--profile",
+    default=DEFAULT_PROFILE,
+    show_default=True,
+    help="Synthetic device profile to emulate.",
+)
+@click.option(
+    "--error",
+    "errors",
+    multiple=True,
+    metavar="SPEC",
+    help="Inject a fault, e.g. 'build:silent' or 'flash_read:bad_length:0.5'.",
+)
+@click.option(
+    "--command",
+    "commands",
+    multiple=True,
+    metavar="CMD",
+    help="Explorer command to run, e.g. 'flash 0x1A000' (repeatable).",
+)
+@click.option(
+    "--script",
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="File of explorer commands, one per line.",
+)
+@click.option(
+    "--interactive",
+    "-i",
+    is_flag=True,
+    help="Open the interactive protocol explorer.",
+)
+@click.option(
+    "--action",
+    type=click.Choice(["fingerprint", "dump", "full"]),
+    help="Run the real auto_exploit() against the virtual link.",
+)
+@click.option(
+    "--list-profiles",
+    is_flag=True,
+    help="List built-in synthetic profiles and exit.",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Print a JSON device report after the session.",
+)
+@click.pass_context
+def emulate(
+    ctx: click.Context,
+    profile: str,
+    errors: tuple[str, ...],
+    commands: tuple[str, ...],
+    script: str | None,
+    interactive: bool,
+    action: str | None,
+    list_profiles: bool,
+    json_output: bool,
+) -> None:
+    """Explore RACE against a virtual headphone (no radio, no hardware)."""
+    if list_profiles:
+        print_profiles(click.echo)
+        return
+
+    code = asyncio.run(
+        run_emulator(
+            profile=profile,
+            error_specs=errors,
+            commands=commands,
+            script_path=script,
+            interactive=interactive,
+            action=action,
+            json_output=json_output,
+            out=click.echo,
+        )
+    )
+    ctx.exit(code)
 
 
 if __name__ == "__main__":

@@ -4,14 +4,22 @@ The transport owns its :class:`bleak.BleakClient` and guarantees cleanup
 (via ``async with`` + ``finally``) even when a command fails, which also
 removes the manual ``disconnect()`` calls scattered through the research
 modules and prevents connection leaks under exceptions/timeouts.
+
+A ``client_factory`` can be injected to substitute a different GATT client.
+The virtual headphone emulator (:mod:`emulator`) uses this to exercise this
+real transport, and the modules above it, without a radio or bleak installed.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 
-from bleak import BleakClient
+try:  # bleak is optional for the offline emulator path
+    from bleak import BleakClient as _BleakClient
+except ImportError:  # pragma: no cover - exercised on machines without bleak
+    _BleakClient = None
 
 from utils.config import RACEConfig
 from utils.packet import RACEProtocolError, build_race_packet, parse_race_response
@@ -25,13 +33,34 @@ class BLETransportError(RACEProtocolError):
     """Raised when a BLE transport operation fails."""
 
 
+#: A callable that turns an address into a bleak-compatible client.
+ClientFactory = Callable[[str], Any]
+
+
+def _default_client_factory(address: str) -> Any:
+    if _BleakClient is None:
+        raise BLETransportError(
+            "bleak is not installed; install runtime dependencies or use the "
+            "virtual emulator (python3 -m emulator)",
+            code="BLEAK_MISSING",
+        )
+    return _BleakClient(address)
+
+
 class BLETransport:
     """Facility for sending/receiving RACE commands over BLE GATT."""
 
-    def __init__(self, address: str, *, config: RACEConfig | None = None) -> None:
+    def __init__(
+        self,
+        address: str,
+        *,
+        config: RACEConfig | None = None,
+        client_factory: ClientFactory | None = None,
+    ) -> None:
         self.address = address
         self.config = config or RACEConfig()
-        self._client: BleakClient | None = None
+        self._client_factory = client_factory
+        self._client: Any | None = None
         self._tx_char = None
         self._rx_char = None
         self._response_queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -52,19 +81,39 @@ class BLETransport:
         """Connect, resolve service/characteristic handles, then start notify."""
         if self.is_connected:
             return
-        self._client = BleakClient(self.address)
-        await self._client.connect(timeout=self.config.connect_timeout_s)
 
-        service = self._resolve_service()
-        if service is None:
-            raise BLETransportError("RACE service not found", code="SERVICE_NOT_FOUND")
-        self._tx_char, self._rx_char = self._resolve_characteristics(service)
+        factory = self._client_factory or _default_client_factory
+        self._client = factory(self.address)
+        try:
+            await self._client.connect(timeout=self.config.connect_timeout_s)
 
-        if self._tx_char is None:
-            raise BLETransportError("RACE TX characteristic not found", code="TX_NOT_FOUND")
+            service = self._resolve_service()
+            if service is None:
+                raise BLETransportError(
+                    "RACE service not found", code="SERVICE_NOT_FOUND"
+                )
+            self._tx_char, self._rx_char = self._resolve_characteristics(service)
 
-        if self._rx_char is not None:
-            self._client.start_notify(self._rx_char, self._notification_handler)
+            if self._tx_char is None:
+                raise BLETransportError(
+                    "RACE TX characteristic not found", code="TX_NOT_FOUND"
+                )
+
+            if self._rx_char is not None:
+                await self._client.start_notify(
+                    self._rx_char, self._notification_handler
+                )
+        except BaseException:
+            # A failed handshake must not leave a half-open link behind.
+            try:
+                if self._client.is_connected:
+                    await self._client.disconnect()
+            except BaseException:
+                pass
+            self._client = None
+            self._tx_char = None
+            self._rx_char = None
+            raise
 
     async def _ensure_connected(self) -> None:
         if self._closed:
@@ -88,11 +137,9 @@ class BLETransport:
                 rx = char
         return tx, rx
 
-    def _notification_handler(self, *_args: Any) -> None:
-        try:
-            self._response_queue.put_nowait(self._client.read_gatt_char(self._rx_char))
-        except Exception:
-            self._response_queue.put_nowait(b"")
+    def _notification_handler(self, _sender: Any, data: Any) -> None:
+        """Queue the notification payload (bleak passes ``sender, data``)."""
+        self._response_queue.put_nowait(bytes(data))
 
     async def send_command(self, cmd: int, payload: bytes = b"") -> bytes:
         """Send a RACE command and return the validated response payload."""
