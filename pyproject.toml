@@ -41,7 +41,7 @@ select = ["E", "F", "I", "UP"]
 
 [tool.mypy]
 python_version = "3.10"
-files = ["utils", "emulator", "transports", "modules"]
+files = ["utils", "transports", "modules", "emulator", "race.py"]
 warn_return_any = true
 warn_unused_configs = true
 check_untyped_defs = true

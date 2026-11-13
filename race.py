@@ -68,6 +68,15 @@ def _build_config(ctx: click.Context, *, timeout: int | None = None) -> RACEConf
     return replace(RACEConfig.cli_defaults(), **overrides)
 
 
+def _note_discovery_only(config: RACEConfig) -> None:
+    """Report that a requested capture stays empty: discovery opens no transport."""
+    if config.capture_path is not None:
+        logger.info(
+            "Wire capture: nothing written - scan/hunt only enumerate; "
+            "use exploit, info, huntandpwn or emulate to record RACE frames"
+        )
+
+
 def _console_result(status: str, result: dict[str, Any]) -> None:
     if status == "success":
         logger.info("Exploit read chain completed (no impersonation claim)")
@@ -130,6 +139,7 @@ def scan(ctx: click.Context, timeout: int, deep: bool) -> None:
     """Discover vulnerable Bluetooth headphones."""
     config = _build_config(ctx, timeout=timeout)
     results = asyncio.run(scan_for_targets(config, deep))
+    _note_discovery_only(config)
     if not results:
         logger.info("No devices found")
         return
@@ -159,6 +169,7 @@ def hunt(ctx: click.Context, timeout: int) -> None:
     """Aggressively hunt for RACE services."""
     config = _build_config(ctx, timeout=timeout)
     results = asyncio.run(aggressive_scan(config, timeout))
+    _note_discovery_only(config)
     if not results:
         logger.info("No RACE devices found")
         return

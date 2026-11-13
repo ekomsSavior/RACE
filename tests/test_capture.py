@@ -1,7 +1,12 @@
 """Tests for the raw pcap/btsnoop wire-capture hook."""
 
 import asyncio
+import logging
+import os
 import struct
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +21,7 @@ from utils.capture import (
     BTSNOOP_EPOCH_DELTA_US,
     BTSNOOP_MAGIC,
     CAPTURE_ENV_VAR,
+    CAPTURE_FILE_MODE,
     CAPTURE_FORMAT_ENV_VAR,
     DLT_BLUETOOTH_HCI_H4_WITH_PHDR,
     H4_ACL_PACKET,
@@ -387,6 +393,127 @@ def test_unwritable_path_raises_capture_error(tmp_path):
     assert error.value.code == "CAPTURE_OPEN"
 
 
+def test_reopen_failure_is_reported_as_capture_error(tmp_path, monkeypatch):
+    def explode(_fd, _length):
+        raise OSError("injected ftruncate failure")
+
+    monkeypatch.setattr("utils.capture.os.ftruncate", explode)
+    with pytest.raises(CaptureError) as error:
+        WireCapture(tmp_path / "race.pcap").open()
+    assert error.value.code == "CAPTURE_OPEN"
+
+    # The failed descriptor is closed, so a retry can take the lock.
+    monkeypatch.undo()
+    capture = WireCapture(tmp_path / "race.pcap")
+    assert capture.open() is capture
+    capture.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="flock is POSIX-only")
+def test_capture_file_is_owner_only(tmp_path):
+    path = tmp_path / "race.pcap"
+    with WireCapture(path):
+        pass
+    assert path.stat().st_mode & 0o777 == CAPTURE_FILE_MODE == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="flock is POSIX-only")
+def test_lock_contention_is_reported(tmp_path, monkeypatch):
+    import fcntl
+
+    def busy(_fd, _operation):
+        raise OSError("resource temporarily unavailable")
+
+    monkeypatch.setattr(fcntl, "flock", busy)
+    with pytest.raises(CaptureError) as error:
+        WireCapture(tmp_path / "race.pcap").open()
+    assert error.value.code == "CAPTURE_LOCKED"
+
+
+def test_failed_lock_releases_the_descriptor(tmp_path, monkeypatch):
+    def explode(_fd):
+        raise CaptureError("already locked", code="CAPTURE_LOCKED")
+
+    monkeypatch.setattr("utils.capture._lock", explode)
+    with pytest.raises(CaptureError):
+        WireCapture(tmp_path / "race.pcap").open()
+
+    monkeypatch.undo()
+    capture = WireCapture(tmp_path / "race.pcap")  # retry must not block on a leak
+    assert capture.open() is capture
+    capture.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="flock is POSIX-only")
+def test_second_process_cannot_clobber_an_open_capture(tmp_path):
+    repo_root = Path(__file__).resolve().parents[1]
+    path = tmp_path / "race.pcap"
+    first = WireCapture(path, clock=_clock(1_700_000_000.0)).open()
+    first.write_tx(FRAME_TX)
+    try:
+        script = (
+            "import sys\n"
+            "from utils.capture import CaptureError, WireCapture\n"
+            f"try:\n    WireCapture({str(path)!r}).open()\n"
+            "except CaptureError as exc:\n    print(exc.code)\n    sys.exit(0)\n"
+            "print('OPENED')\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+            timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "CAPTURE_LOCKED"
+        # The rejected opener must not have truncated the live file.
+        assert [r[3][PCAP_PHDR_LEN] for r in _pcap_records(path)] == [H4_ACL_PACKET]
+    finally:
+        first.close()
+
+    # Once the writer is gone, the same path can be opened again.
+    with WireCapture(path):
+        pass
+
+
+def test_capture_failures_are_logged_once(tmp_path, caplog):
+    capture = WireCapture(tmp_path / "race.pcap").open()
+    capture.close()
+
+    caplog.set_level(logging.WARNING, logger="race")
+    for _ in range(5):
+        assert tap(capture, "tx", FRAME_TX) is False
+
+    messages = [r.message for r in caplog.records if "Wire capture write failed" in r.message]
+    assert len(messages) == 1
+    assert "suppressed" in messages[0]
+
+
+def test_conflicting_format_request_warns_once(tmp_path, caplog, monkeypatch):
+    monkeypatch.delenv(CAPTURE_ENV_VAR, raising=False)
+    path = tmp_path / "race.pcap"
+
+    first = open_capture(path, "pcap")
+    caplog.set_level(logging.WARNING, logger="race")
+    second = open_capture(path, "btsnoop")
+    open_capture(path, "btsnoop")
+
+    assert second is first
+    assert second.format is CaptureFormat.PCAP
+    warnings = [r.message for r in caplog.records if "already open as pcap" in r.message]
+    assert len(warnings) == 1
+
+
+def test_enabling_a_capture_notes_its_sensitivity(tmp_path, caplog, monkeypatch):
+    monkeypatch.delenv(CAPTURE_ENV_VAR, raising=False)
+    caplog.set_level(logging.INFO, logger="race")
+
+    open_capture(tmp_path / "race.pcap")
+
+    assert any("key material" in r.message for r in caplog.records)
+
+
 # -- transport integration -------------------------------------------------
 
 
@@ -491,6 +618,32 @@ def test_transport_ignores_non_byte_frames(tmp_path):
     asyncio.run(session())
     (record,) = _pcap_records(path)
     assert _att_fields(record[3])["value"] == b"\x05\x01\x02\x00\x08\x1e"
+
+
+class _DuplicateClient(_FakeClient):
+    """Emits a duplicate notification for every write, like the emulator's fault."""
+
+    async def write_gatt_char(self, char, data, response=True):
+        self.notify_handler(None, FRAME_RX)
+        self.notify_handler(None, FRAME_RX)
+
+
+def test_every_notification_is_captured_not_just_the_consumed_one(tmp_path):
+    # A duplicate or late reply must reach the file even though the transport
+    # dequeues only one frame per command.
+    path = tmp_path / "dup.pcap"
+    config = RACEConfig(capture_path=str(path))
+
+    async def session():
+        async with BLETransport(
+            "AA:BB:CC:DD:EE:FF", config=config, client_factory=_DuplicateClient
+        ) as transport:
+            return await transport.send_command(CMD_GET_BUILD)
+
+    assert asyncio.run(session()) == FRAME_RX[6:]
+
+    values = [_att_fields(r[3])["value"] for r in _pcap_records(path)]
+    assert values == [FRAME_TX, FRAME_RX, FRAME_RX]
 
 
 def test_sequential_connections_append_to_one_capture(tmp_path, monkeypatch):

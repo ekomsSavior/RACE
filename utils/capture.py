@@ -59,6 +59,8 @@ PCAP_VERSION_MAJOR = 2
 PCAP_VERSION_MINOR = 4
 PCAP_SNAPLEN = 65535
 DLT_BLUETOOTH_HCI_H4_WITH_PHDR = 201
+#: Captures are evidence-quality data, so they are owner-only from creation.
+CAPTURE_FILE_MODE = 0o600
 #: Per-packet pcap pseudo-header: big-endian direction word, bit 0 = received.
 PCAP_PHDR_LEN = 4
 PCAP_PHDR_SENT = 0
@@ -208,16 +210,33 @@ class WireCapture:
     # -- lifecycle ---------------------------------------------------------
 
     def open(self) -> WireCapture:
-        """Create/truncate the file and write its container header."""
+        """Create/truncate the file, lock it, and write its container header."""
         if self._fh is not None:
             return self
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            fh = self.path.open("wb")
+            # 0600 up front: captures carry raw device data, including possible
+            # key material, so the process umask must not decide who can read it.
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT, CAPTURE_FILE_MODE)
         except OSError as exc:
             raise CaptureError(
                 f"Cannot open capture {self.path}: {exc}", code="CAPTURE_OPEN"
             ) from exc
+
+        try:
+            os.chmod(self.path, CAPTURE_FILE_MODE)
+            _lock(fd)  # refuse to truncate a file another run is writing
+            os.ftruncate(fd, 0)
+            fh = os.fdopen(fd, "wb")
+        except CaptureError:
+            os.close(fd)
+            raise
+        except OSError as exc:
+            os.close(fd)
+            raise CaptureError(
+                f"Cannot open capture {self.path}: {exc}", code="CAPTURE_OPEN"
+            ) from exc
+
         self._fh = fh
         fh.write(self._header())
         fh.flush()
@@ -318,17 +337,45 @@ class WireCapture:
         return header + data
 
 
+def _lock(fd: int) -> None:
+    """Take an exclusive lock so two runs cannot interleave one capture file.
+
+    POSIX-only; on platforms without ``fcntl`` the file is simply unprotected.
+    The lock is released by :meth:`WireCapture.close` (or process exit).
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows has no fcntl
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        raise CaptureError(
+            f"Capture is already open by another process: {exc}", code="CAPTURE_LOCKED"
+        ) from exc
+
+
+def _warn_once(key: tuple[str, str], message: str) -> None:
+    """Log a capture problem once per (file, kind), not once per frame."""
+    if key in _warned:
+        return
+    _warned.add(key)
+    logger.warning(message)
+
+
 def _check_handle(value: int, name: str) -> int:
     if not 0 <= value <= 0xFFFF:
         raise CaptureError(f"{name} must be a 16-bit handle (0..0xFFFF)", code="CAPTURE_HANDLE")
     return value
 
 
-#: Process-wide sinks, keyed by the resolved path.  Sharing one handle is what
+#: Process-wide sinks, keyed by the requested path.  Sharing one handle is what
 #: lets a hunt across several devices -- or an emulator run that opens both the
 #: real transport and the raw explorer -- append to a single file instead of
 #: truncating it on every connection.
 _captures: dict[str, WireCapture] = {}
+#: (file, failure) pairs already reported, so a broken capture logs once.
+_warned: set[tuple[str, str]] = set()
 
 
 def open_capture(
@@ -356,6 +403,12 @@ def open_capture(
     key = str(Path(target).expanduser())
     shared = _captures.get(key)
     if shared is not None:
+        if fmt is not None and CaptureFormat.coerce(fmt, key) is not shared.format:
+            _warn_once(
+                (key, "format"),
+                f"Wire capture {key} is already open as {shared.format.value}; "
+                f"ignoring conflicting format request {fmt!r}",
+            )
         return shared
     if fmt is None:
         fmt = os.environ.get(CAPTURE_FORMAT_ENV_VAR) or None
@@ -363,6 +416,11 @@ def open_capture(
         key, fmt, tx_handle=tx_handle, rx_handle=rx_handle, clock=clock
     ).open()
     _captures[key] = capture
+    logger.info(
+        "Wire capture %s [%s] - raw device data, may include key material; keep private",
+        key,
+        capture.format.value,
+    )
     return capture
 
 
@@ -370,6 +428,7 @@ def close_captures() -> tuple[WireCapture, ...]:
     """Flush and close every shared capture, then reset the registry."""
     captures = tuple(_captures.values())
     _captures.clear()
+    _warned.clear()
     for capture in captures:
         capture.close()
     return captures
@@ -387,7 +446,11 @@ def tap(capture: WireCapture | None, direction: Direction, frame: object) -> boo
     try:
         capture.record(direction, frame)
     except CaptureError as exc:
-        logger.warning("Wire capture write failed: %s", exc)
+        _warn_once(
+            (str(capture.path), exc.code),
+            f"Wire capture write failed: {exc} "
+            f"(further {exc.code} failures for this file are suppressed)",
+        )
         return False
     return True
 

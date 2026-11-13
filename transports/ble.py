@@ -26,11 +26,18 @@ from utils.packet import (
     parse_race_response,
 )
 
-_BleakClient: Any
-try:  # bleak is optional for the offline emulator path
-    from bleak import BleakClient as _BleakClient
-except ImportError:  # pragma: no cover - exercised on machines without bleak
-    _BleakClient = None
+
+def _bleak_client() -> Any:
+    """Return bleak's client class, or ``None`` when bleak is not installed."""
+    try:
+        from bleak import BleakClient
+    except ImportError:  # pragma: no cover - exercised on machines without bleak
+        return None
+    return BleakClient
+
+
+#: bleak is optional for the offline emulator path.
+_BleakClient = _bleak_client()
 
 logger = logging.getLogger("race")
 
@@ -70,7 +77,7 @@ class BLETransport:
         self.address = address
         self.config = config or RACEConfig()
         self._client_factory = client_factory
-        self._client: Any | None = None
+        self._client: Any = None
         self._tx_char = None
         self._rx_char = None
         self._response_queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -166,17 +173,28 @@ class BLETransport:
         return tx, rx
 
     def _notification_handler(self, _sender: Any, data: Any) -> None:
-        """Queue the notification payload (bleak passes ``sender, data``)."""
-        self._response_queue.put_nowait(bytes(data))
+        """Capture and queue a notification payload (bleak passes ``sender, data``).
+
+        Recording happens here, at arrival, rather than when a command dequeues
+        the frame: duplicates, unsolicited notifications and replies that land
+        after ``read_timeout_s`` all reach the file, stamped with the time they
+        actually arrived instead of the time the next command consumed them.
+        """
+        payload = bytes(data)
+        self._record("rx", payload)
+        self._response_queue.put_nowait(payload)
 
     def _discard_pending(self) -> None:
-        """Drop notifications/partial frames that predate the next write."""
+        """Drop notifications/partial frames that predate the next write.
+
+        Notification bytes were already captured on arrival; draining here only
+        removes them from this command's correlation window.
+        """
         while True:
             try:
-                raw = self._response_queue.get_nowait()
+                self._response_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            self._record("rx", raw)
         self._assembler.reset()
         self._assembled.clear()
 
@@ -186,9 +204,10 @@ class BLETransport:
         Notifications are not a one-to-one reply channel: a device can emit
         unsolicited frames, duplicate a reply, or deliver a late answer for the
         previous command.  Notifications that predate this write are drained
-        (and captured) first, then every complete frame is correlated by
-        response opcode; mismatched/unsolicited frames are discarded until the
-        deadline.  A trailing partial frame is reported as a truncated reply.
+        first (their bytes were already captured on arrival), then every
+        complete frame is correlated by response opcode; mismatched/unsolicited
+        frames are discarded until the deadline.  A trailing partial frame is
+        reported as a truncated reply.
         """
         await self._ensure_connected()
         client = self._client
@@ -197,8 +216,8 @@ class BLETransport:
 
         # A late reply to a previous command can carry the same opcode we are
         # about to send.  Correlation by opcode cannot distinguish it, so
-        # discard everything that arrived before this write.  Stale bytes are
-        # still tapped into the capture: they were on the wire.
+        # discard everything that arrived before this write.  The capture
+        # already has those bytes with their true arrival time.
         self._discard_pending()
 
         packet = build_race_packet(cmd, payload, head=self.config.head_standard)
@@ -244,9 +263,6 @@ class BLETransport:
             except asyncio.TimeoutError:
                 break
 
-            # Capture before validation so malformed/failing replies are on
-            # disk even when BAD_RESPONSE is what ends the session.
-            self._record("rx", raw)
             try:
                 self._assembled.extend(self._assembler.feed(raw))
             except RACEProtocolError as exc:

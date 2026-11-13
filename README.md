@@ -404,6 +404,12 @@ RACE_CAPTURE=/tmp/session.btsnoop sudo -E python3 race.py huntandpwn --timeout 3
 
 `--capture-format {pcap,btsnoop}` (or `RACE_CAPTURE_FORMAT`) overrides the extension. Each RACE frame is wrapped in a synthetic **HCI ACL → L2CAP (CID `0x0004`) → ATT PDU** chain — requests as ATT Write Commands on handle `0x0023`, responses as ATT Handle Value Notifications on `0x0026` — with the RACE bytes untouched as the attribute value. Direction rides in the pcap pseudo-header and the btsnoop flags, so both readers label host → device and device → host correctly.
 
+Three behavioural details matter when you read a capture back:
+
+- **Responses are recorded at arrival, not at dequeue.** Duplicates, unsolicited notifications and replies that land after `read_timeout_s` all reach the file, stamped with the time they actually arrived — they are not silently dropped, and they are not attributed to whichever command happened to consume them later.
+- **The file is `0600` from creation and is not sanitised.** A capture contains every byte the device returned, including the flash window in `--action dump` and therefore candidate link-key material. Treat it like key material: no tickets, no public issues, no shared volumes.
+- **One writer per path.** A second process opening a capture another run still holds fails with `CAPTURE_LOCKED` instead of truncating the live file; within a process the sink is shared, so a multi-device hunt appends. Broken sinks log once per file and failure kind, not once per frame.
+
 ```bash
 # just the RACE frames, as hex + opcode, no GUI
 tshark -r /tmp/session.pcap -Y btatt -T fields -e btatt.opcode -e btatt.value
@@ -442,6 +448,8 @@ VULNERABLE_MODELS = [
 ```
 
 Substring match against the advertised local name. It is a **pre-filter, not proof** — a renamed Sony headset drops out of `scan --deep`, while any device that puts "Bose" in its name gets probed. `aggressive_scan` deliberately ignores the list and verifies the service UUID instead; use it when the heuristic is suspect.
+
+Both scanners request advertisement data (`BleakScanner.discover(return_adv=True)`) because bleak ≥ 0.22 removed `BLEDevice.rssi`. `aggressive_scan` also reports a failed per-device probe instead of abandoning the sweep, and continues with the remaining peers.
 
 ```mermaid
 flowchart TD
@@ -579,6 +587,7 @@ Honest matrix — what exists, what is a constant, and what is not written yet:
 | Capability | Component | State |
 |:-----------|:----------|:------|
 | BLE discovery + RSSI | `modules/discovery.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
+| RSSI on bleak ≥ 0.22 (removed `BLEDevice.rssi`) | `modules/discovery.py` | ![fixed](https://img.shields.io/badge/fixed-2ea043?style=flat-square) |
 | Deep service verification | `modules/discovery.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
 | Build fingerprint (`0x1E08`) | `modules/fingerprint.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
 | BD_ADDR read (`0x0C05`) | `modules/exploit.py` | ![done](https://img.shields.io/badge/implemented-2ea043?style=flat-square) |
@@ -627,6 +636,7 @@ RACE/
 │   ├── test_emulator.py     # stdlib-only emulator/integration tests
 │   ├── test_capture.py      # pcap/btsnoop layout + transport capture hooks
 │   ├── test_cli.py          # group options → session config wiring
+│   ├── test_discovery.py    # RSSI reporting + probe-failure handling
 │   └── test_packet.py       # frame codec tests
 ├── modules/
 │   ├── discovery.py         # name heuristic + service probing
@@ -658,6 +668,8 @@ RACE/
 | `Operation not permitted` | Adapter needs raw HCI access | Run with `sudo`, or grant `CAP_NET_RAW` + `CAP_NET_ADMIN` |
 | Scan returns nothing | No discoverable advertisers in range | Increase `--timeout`; BLE advertisers rotate addresses — rescan |
 | No capture file appears | The session never opened a transport (failed connect, or `scan`/`hunt`, which only enumerate) | Use `--capture` with `exploit`/`info`/`huntandpwn`/`emulate`; check the `Wire capture` log line for the resolved path |
+| `CAPTURE_LOCKED` | Another process is still writing the same capture path | Wait for that run to exit, or pass a different `--capture` path |
+| `hunt` reports no devices | Fixed: `aggressive_scan` read the removed `BLEDevice.rssi` (bleak ≥ 0.22), which raised inside the probe loop and was swallowed | Upgrade; RSSI now comes from `return_adv=True`, and a failing probe is printed per device |
 | `BLEAK_MISSING` | `bleak` is absent and the client had no injected factory | `pip3 install -e .`, or run `python3 -m emulator` |
 | `already has a central connected` | Two virtual clients share one `VirtualHeadphone` | Close the first transport/session; the emulator models one central |
 | Emulator shows `-- no response --` | A `silent`, `disconnect` or over-timeout `slow` fault fired | Inspect `faults`, lower `--read-timeout`, or `clear-faults` in the explorer |

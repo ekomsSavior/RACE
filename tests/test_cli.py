@@ -1,5 +1,7 @@
 """CLI plumbing tests: group-level capture options reach the session config."""
 
+import logging
+
 import pytest
 from click.testing import CliRunner
 
@@ -108,3 +110,19 @@ def test_emulate_forwards_mtu_and_discover(monkeypatch):
     assert result.exit_code == 0, result.output
     assert seen["att_mtu"] == 23
     assert seen["discover"] is True
+
+
+def test_scan_reports_that_capture_does_not_apply(tmp_path, monkeypatch, caplog):
+    path = tmp_path / "scan.pcap"
+
+    async def fake_scan(config, deep):
+        return []
+
+    monkeypatch.setattr(race, "scan_for_targets", fake_scan)
+    caplog.set_level(logging.INFO, logger="race")
+
+    result = CliRunner().invoke(race.cli, ["--capture", str(path), "scan"])
+
+    assert result.exit_code == 0, result.output
+    assert any("nothing written" in r.message for r in caplog.records)
+    assert not path.exists()

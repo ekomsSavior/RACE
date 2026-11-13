@@ -100,9 +100,9 @@ def describe_response(pkt: RacePacket) -> str:
         return f"data {len(payload)} B (no status prefix)"
 
     if cmd in (CMD_WRITE_FLASH, CMD_FOTA):
-        status = _status_from(payload)
-        if status is not None:
-            return f"status 0x{status:04X} ({status_name(status)})"
+        code = _status_from(payload)
+        if code is not None:
+            return f"status 0x{code:04X} ({status_name(code)})"
         return f"{len(payload)} B"
 
     if cmd == CMD_GET_RAM:
@@ -115,9 +115,9 @@ def describe_response(pkt: RacePacket) -> str:
         return f"data {len(payload)} B"
 
     if cmd == CMD_SET_RAM:
-        status = _status_from(payload)
-        if status is not None:
-            return f"status 0x{status:04X} ({status_name(status)})"
+        code = _status_from(payload)
+        if code is not None:
+            return f"status 0x{code:04X} ({status_name(code)})"
         return f"{len(payload)} B"
 
     return f"payload {hex_bytes(payload, 12)}"

@@ -21,6 +21,11 @@ except ImportError:  # pragma: no cover - exercised on machines without bleak
     _BleakClient = None
     _BleakScanner = None
 
+# Backwards-compatible module-level names; tests and callers can monkeypatch
+# these without touching the injectable scanner/client parameters.
+BleakClient: Any = _BleakClient
+BleakScanner: Any = _BleakScanner
+
 RACE_SERVICE_UUID = "00001200-0000-1000-8000-00805f9b34fb"
 RACE_TX_UUID = "00001201-0000-1000-8000-00805f9b34fb"
 RACE_RX_UUID = "00001202-0000-1000-8000-00805f9b34fb"
@@ -44,11 +49,11 @@ ClientFactory = Callable[[str], Any]
 def _scanner_or_default(scanner: Any | None) -> Any:
     if scanner is not None:
         return scanner
-    if _BleakScanner is None:
+    if BleakScanner is None:
         raise RuntimeError(
             "bleak is not installed; install runtime dependencies or inject a scanner"
         )
-    return _BleakScanner
+    return BleakScanner
 
 
 def _client_factory_or_default(
@@ -56,11 +61,11 @@ def _client_factory_or_default(
 ) -> ClientFactory:
     if client_factory is not None:
         return client_factory
-    if _BleakClient is None:
+    if BleakClient is None:
         raise RuntimeError(
             "bleak is not installed; install runtime dependencies or inject a client factory"
         )
-    return cast(ClientFactory, _BleakClient)
+    return cast(ClientFactory, BleakClient)
 
 
 async def scan_for_targets(
@@ -138,7 +143,8 @@ async def aggressive_scan(
     """Find ANY device with the RACE service exposed.
 
     Unlike :func:`scan_for_targets`, this ignores the advertised-name
-    heuristic and verifies the service UUID on every peer.
+    heuristic and verifies the service UUID on every peer.  ``return_adv=True``
+    is required for RSSI: bleak >= 0.22 removed ``BLEDevice.rssi``.
     """
     out("=" * 60)
     out("  RACE HUNTER - Finding vulnerable Bluetooth devices")
@@ -146,33 +152,33 @@ async def aggressive_scan(
 
     out("[*] Scanning for devices...")
     active_scanner = _scanner_or_default(scanner)
-    devices = await active_scanner.discover(timeout=timeout)
+    devices = await active_scanner.discover(timeout=timeout, return_adv=True)
     factory = _client_factory_or_default(client_factory)
 
     race_devices: list[dict[str, Any]] = []
     total = len(devices)
     checked = 0
 
-    for device in devices:
+    for address, (device, adv_data) in devices.items():
         checked += 1
-        out(f"  [*] Checking {checked}/{total}: {device.address[:8]}...")
+        out(f"  [*] Checking {checked}/{total}: {address[:8]}...")
 
-        client = factory(device.address)
+        client = factory(address)
         try:
             await client.connect(timeout=3)
             for service in client.services:
                 if service.uuid.lower() == config.service_uuid.lower():
                     race_devices.append(
                         {
-                            "address": device.address,
+                            "address": address,
                             "name": device.name or "Unknown",
-                            "rssi": getattr(device, "rssi", "N/A"),
+                            "rssi": adv_data.rssi if adv_data else "N/A",
                         }
                     )
                     out("  [+] RACE device found!")
                     break
-        except Exception:
-            pass
+        except Exception as exc:
+            out(f"  [-] {address[:8]} probe failed: {str(exc)[:50]}")
         finally:
             try:
                 await client.disconnect()
